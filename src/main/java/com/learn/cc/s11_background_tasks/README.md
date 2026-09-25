@@ -143,6 +143,8 @@ private static BashResult runBashProcess(String command) {
         LIVE_PROCESSES.add(p);
         boolean finished = p.waitFor(120, TimeUnit.SECONDS);
         if (!finished) {
+            // 先杀子孙进程, 再杀 shell (顺序见下文)
+            p.descendants().forEach(ProcessHandle::destroyForcibly);
             p.destroyForcibly();
             return new BashResult("Error: Timeout (120s)", null);
         }
@@ -163,7 +165,9 @@ private static BashResult runBashProcess(String command) {
 
 Agent 经正常路径、`Ctrl+C` / `SIGTERM` 退出时，shutdown hook 会清理还在运行的命令及其子进程；`kill -9` 杀掉 JVM 时 hook 不会运行。
 
-这只是生命周期清理，并不是沙箱，而且比 Python 原版的进程组弱：`descendants()` 只能沿父子关系找到**还挂在 shell 下面**的进程。shell 一旦退出（命令正常结束）或被 `destroyForcibly()` 杀掉（超时分支先杀 shell，再进 `finally`），它的子进程就会被 init 收养，`finally` 里的 `descendants()` 已经找不到它们。也就是说，命令超时后，shell 起的子进程可能继续运行；Python 原版用 `os.killpg` 按进程组杀，不受这个限制。
+超时分支里**先杀子孙进程、再杀 shell**，顺序不能反。`descendants()` 只能沿父子关系找到还挂在 shell 下面的进程；如果先 `destroyForcibly()` 杀掉 shell，它的子进程会立刻被 init 收养，之后再调 `descendants()` 就找不到了，超时命令起的子进程会在后台继续运行。Python 原版用 `os.killpg` 按进程组杀，没有这个顺序问题。
+
+这只是生命周期清理，并不是沙箱，而且比进程组弱：命令正常结束时 shell 已经退出，它用 `&` 留下的子进程同样已被 init 收养，`finally` 里的 `descendants()` 清不到；已经主动脱离父进程（比如 `nohup ... &`、`setsid`）的进程也不在清理范围内。
 
 ### collect: 通知收集
 
