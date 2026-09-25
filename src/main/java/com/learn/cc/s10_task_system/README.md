@@ -1,7 +1,8 @@
 # s10: Task System — 从执行清单到可协调的任务状态
 
-> ℹ️ 本章正文代码片段沿用 Python 原版以突出机制；对应 Java 实现见同目录 `AgentLoop.java`。
-> s06 / s07 / s13 / s15 / s17 相比原版做了教学取舍，详见各自 `AgentLoop.java` 顶部注释。
+> ℹ️ 下面的代码片段摘自同目录 `AgentLoop.java`（有删减，完整可运行版见该文件）。
+> Java 用不可变的 `record Task` 表示任务，所以每次改状态或依赖都是 `new Task(...)` 生成新对象再 `TASKS.save(...)` 写回文件，
+> 而不是像 Python dataclass 那样原地改字段。
 
 s01 → ... → s08 → s09 → `s10` → [s11](../s11_background_tasks/) → s12 → ... → s16 → s17
 
@@ -27,7 +28,7 @@ TodoWrite 没有记录这些依赖和分工。它可以显示“编写 API”仍
 
 ![Task System Overview](images/task-system-overview.svg)
 
-代码保留 S04 的五个基础工具、Permission、Hooks 和统一 `execute_tool`，再加入 6 个任务工具、`.tasks/` 目录持久化和 `blockedBy` 依赖检查。
+代码保留 S04 的五个基础工具、Permission、Hooks 和统一的 `dispatchTool` 分发，再加入 6 个任务工具、`.tasks/` 目录持久化和 `blockedBy` 依赖检查。
 
 TodoWrite vs Task System：
 
@@ -52,108 +53,246 @@ TodoWrite vs Task System：
 
 每个任务是一个 JSON 文件，存于 `.tasks/` 目录：
 
-```python
-@dataclass
-class Task:
-    id: str
-    subject: str
-    description: str
-    status: str          # pending | in_progress | completed
-    owner: str | None    # 负责当前任务的 Agent
-    blockedBy: list[str] # 依赖的任务 ID 列表
+```java
+/** 任务 id 格式: task_{8 位 hex}, 由系统生成,模型不能自选 */
+private static final Pattern TASK_ID_PATTERN = Pattern.compile("^task_[0-9a-f]{8}$");
+
+public record Task(String id,
+                   String subject,
+                   String description,
+                   String status,           // pending | in_progress | completed
+                   String owner,            // 负责当前任务的 Agent, 未认领时为 null
+                   List<String> blockedBy)  // 依赖的任务 ID 列表
+{}
 ```
 
 ID 使用 `task_` 加 8 位随机十六进制字符生成。创建文件时使用排他写入；如果 ID 已存在，就重新生成。
 
-`TaskStore` 负责校验任务 ID 和读写 JSON 文件，`TASKS = TaskStore(TASKS_DIR)` 是本章使用的任务存储。
+`TaskStore` 负责校验任务 ID 和读写 JSON 文件，`private static final TaskStore TASKS = new TaskStore(TASKS_DIR);` 是本章使用的任务存储。
 
 ### create_task: 创建任务
 
-```python
-def create_task(subject: str, description: str = "") -> Task:
-    return TASKS.create(subject, description)
+模型调用 `create_task` 时，`dispatchTool` 转到 `runCreateTask`，它只是包一层 `TASKS.create`：
+
+```java
+private static String runCreateTask(String subject, String description) {
+    try {
+        Task task = TASKS.create(subject, description == null ? "" : description);
+        return "Created " + task.id() + ": " + task.subject();
+    } catch (Exception e) { return "Error: " + e.getMessage(); }
+}
 ```
 
-`TaskStore.create` 检查 subject，分配随机 ID，再把任务写入 `.tasks/{id}.json`。新任务的 `blockedBy` 固定为空，工具结果会把运行时生成的 ID 返回给模型。
+`TaskStore.create` 检查 subject，分配随机 ID，再把任务写入 `.tasks/{id}.json`。排他写入靠 `Files.createFile`——文件已存在时它会抛 `FileAlreadyExistsException`，捕获后换一个 ID 重试：
+
+```java
+Task create(String subject, String description) throws IOException {
+    String s = subject == null ? "" : subject.strip();
+    if (s.isEmpty()) throw new IllegalArgumentException("Task subject cannot be empty");
+    root(true);
+
+    for (int attempt = 0; attempt < 100; attempt++) {
+        byte[] bytes = new byte[4];
+        RNG.nextBytes(bytes);                       // SecureRandom
+        StringBuilder hex = new StringBuilder("task_");
+        for (byte b : bytes) hex.append(String.format("%02x", b));
+        String id = hex.toString();
+        Path p = pathOf(id, true);
+        try {
+            Files.createFile(p);                    // O_CREAT | O_EXCL
+            Task task = new Task(id, s, description == null ? "" : description,
+                    "pending", null, new ArrayList<>());
+            Files.writeString(p, taskToJson(task));
+            return task;
+        } catch (FileAlreadyExistsException e) {
+            // 撞了 → 换 id 重试
+        }
+    }
+    throw new IOException("Could not allocate a unique task ID");
+}
+```
+
+新任务的 `blockedBy` 固定为空，工具结果会把运行时生成的 ID 返回给模型。
 
 ### update_task: 使用返回的 ID 添加依赖
 
-```python
-def update_task(task_id: str, addBlockedBy: list[str]) -> Task:
-    return TASKS.update_dependencies(task_id, addBlockedBy)
+```java
+private static String runUpdateTask(String taskId, Object addBlockedByObj) {
+    try {
+        if (!(addBlockedByObj instanceof List<?> list)) {
+            return "Error: addBlockedBy must be a list";
+        }
+        List<String> deps = new ArrayList<>();
+        for (Object o : list) deps.add(String.valueOf(o));
+        Task task = TASKS.updateDependencies(taskId, deps);
+        String depsStr = task.blockedBy().isEmpty() ? "(none)" : String.join(", ", task.blockedBy());
+        return "Updated " + task.id() + " blockedBy: " + depsStr;
+    } catch (Exception e) { return "Error: " + e.getMessage(); }
+}
 ```
 
 任务图采用两阶段构建：先创建所有节点，再使用 `create_task` 返回的 ID 调用 `update_task` 添加边。模型可能在一条回复里同时发出多个工具调用，而这些同级调用在任何工具结果产生前就已经确定，因此某个 `create_task` 无法直接使用另一个调用刚生成的 ID。
 
 `update_task` 会先校验整次修改，再统一保存。目标任务和依赖必须存在，目标必须仍为 pending 且无人认领，并且不能形成自依赖或环。重复添加已有依赖是安全的，不会产生重复边。
 
-### can_start: 依赖检查
+这些校验都在 `TaskStore.updateDependencies` 里，环检测交给 `dependsOn`（用栈做迭代 DFS，看 `dep` 是否已经传递依赖 `taskId`）：
+
+```java
+Task updateDependencies(String taskId, List<String> addBlockedBy) throws IOException {
+    if (addBlockedBy == null) throw new IllegalArgumentException("addBlockedBy must be a list");
+    Task task = load(taskId);
+    if (!"pending".equals(task.status()) || task.owner() != null) {
+        throw new IllegalArgumentException(
+                "Task " + taskId + " dependencies can only be updated while pending and unowned");
+    }
+    // 去重 (保序)
+    List<String> deps = new ArrayList<>(new LinkedHashSet<>(addBlockedBy));
+    for (String dep : deps) {
+        if (dep.equals(taskId)) throw new IllegalArgumentException("Task cannot depend on itself");
+        if (!exists(dep)) throw new IllegalArgumentException("Dependency not found: " + dep);
+        // 循环检测: 只对未加过的检查 (加过的说明之前已过关)
+        if (!task.blockedBy().contains(dep) && dependsOn(dep, taskId)) {
+            throw new IllegalArgumentException("Dependency cycle detected: " + taskId + " -> " + dep);
+        }
+    }
+    // 全部校验通过后才一次性写入
+    List<String> newBlockedBy = new ArrayList<>(task.blockedBy());
+    for (String dep : deps) if (!newBlockedBy.contains(dep)) newBlockedBy.add(dep);
+    Task updated = new Task(task.id(), task.subject(), task.description(),
+            task.status(), task.owner(), newBlockedBy);
+    save(updated);
+    return updated;
+}
+
+boolean dependsOn(String taskId, String targetId) throws IOException {
+    Deque<String> pending = new ArrayDeque<>();
+    Set<String> visited = new HashSet<>();
+    pending.push(taskId);
+    while (!pending.isEmpty()) {
+        String current = pending.pop();
+        if (current.equals(targetId)) return true;
+        if (!visited.add(current)) continue;
+        if (!exists(current)) continue;
+        for (String dep : load(current).blockedBy()) pending.push(dep);
+    }
+    return false;
+}
+```
+
+### canStart: 依赖检查
 
 一个任务只能在它的 `blockedBy` **全部 completed** 之后才能开始：
 
-```python
-def can_start(task_id: str) -> bool:
-    return not incomplete_dependencies(load_task(task_id))
+```java
+/** 找出没完成的依赖 (查不到的也算未完成) */
+private static List<String> incompleteDependencies(Task task) {
+    List<String> incomplete = new ArrayList<>();
+    for (String dep : task.blockedBy()) {
+        try {
+            if (!"completed".equals(TASKS.load(dep).status())) incomplete.add(dep);
+        } catch (Exception e) {
+            incomplete.add(dep);
+        }
+    }
+    return incomplete;
+}
+
+private static boolean canStart(String taskId) throws IOException {
+    return incompleteDependencies(TASKS.load(taskId)).isEmpty();
+}
 ```
 
-`incomplete_dependencies` 读取每个前置任务。只要有一个不是 completed，或者对应文件已经不存在，任务就不能认领。
+`incompleteDependencies` 读取每个前置任务。只要有一个不是 completed，或者对应文件已经不存在（`load` 抛异常），任务就不能认领。
 
 ### claim_task: 认领任务
 
 Agent 开始做一个任务时，调用 `claim_task`：设置 `owner`，状态从 `pending` → `in_progress`。`owner` 字段记录谁认领了这个任务：
 
-```python
-def claim_task(task_id: str, owner: str = "agent") -> str:
-    task = load_task(task_id)
-    if task.status != "pending":
-        return f"Task {task_id} is {task.status}, cannot claim"
-    dependencies = incomplete_dependencies(task)
-    if dependencies:
-        return f"Blocked by: {dependencies}"
-    task.owner = owner
-    task.status = "in_progress"
-    TASKS.save(task)
-    return f"Claimed {task_id} ({task.subject})"
+```java
+private static String claimTask(String taskId, String owner) {
+    try {
+        Task task = TASKS.load(taskId);
+        if (!"pending".equals(task.status())) {
+            return "Task " + taskId + " is " + task.status() + ", cannot claim";
+        }
+        List<String> incomplete = incompleteDependencies(task);
+        if (!incomplete.isEmpty()) return "Blocked by: " + incomplete;
+        Task updated = new Task(task.id(), task.subject(), task.description(),
+                "in_progress", owner, task.blockedBy());
+        TASKS.save(updated);
+        return "Claimed " + updated.id() + " (" + updated.subject() + ")";
+    } catch (Exception e) { return "Error: " + e.getMessage(); }
+}
 ```
 
-如果任务不是 pending，或者依赖没有完成，就拒绝认领。S10 只处理顺序执行的状态更新。
+如果任务不是 pending，或者依赖没有完成，就拒绝认领。S10 只处理顺序执行的状态更新。`dispatchTool` 调用时 `owner` 固定传 `"agent"`。
 
 ### complete_task: 完成与解锁
 
 任务做完后，设为 `completed`。同时扫描所有其他任务，找出**刚刚被解锁**的下游任务：
 
-```python
-def complete_task(task_id: str, owner: str = "agent") -> str:
-    task = load_task(task_id)
-    if task.status != "in_progress":
-        return f"Task {task_id} is {task.status}, cannot complete"
-    if task.owner != owner:
-        return f"Task {task_id} is owned by {task.owner}, not {owner}"
-    ready_before = {t.id for t in list_tasks()
-                    if t.status == "pending" and t.blockedBy
-                    and can_start(t.id)}
-    task.status = "completed"
-    TASKS.save(task)
-    unblocked = [t.subject for t in list_tasks()
-                 if t.status == "pending" and t.blockedBy
-                 and t.id not in ready_before
-                 and can_start(t.id)]
-    msg = f"Completed {task_id} ({task.subject})"
-    if unblocked:
-        msg += f"\nUnblocked: {', '.join(unblocked)}"
-    return msg
+```java
+private static String completeTask(String taskId, String owner) {
+    try {
+        Task task = TASKS.load(taskId);
+        if (!"in_progress".equals(task.status())) {
+            return "Task " + taskId + " is " + task.status() + ", cannot complete";
+        }
+        if (!owner.equals(task.owner())) {
+            return "Task " + taskId + " is owned by " + task.owner() + ", not " + owner;
+        }
+        // 完成前: 记下"有依赖且已经可以启动"的 pending 任务, 作为基准
+        Set<String> readyBefore = new HashSet<>();
+        for (Task t : TASKS.listAll()) {
+            if ("pending".equals(t.status()) && !t.blockedBy().isEmpty()) {
+                try { if (canStart(t.id())) readyBefore.add(t.id()); }
+                catch (Exception ignore) {}
+            }
+        }
+        Task updated = new Task(task.id(), task.subject(), task.description(),
+                "completed", owner, task.blockedBy());
+        TASKS.save(updated);
+        // 完成后: 找出"这次才变成可启动"的任务
+        List<String> unblocked = new ArrayList<>();
+        for (Task t : TASKS.listAll()) {
+            if ("pending".equals(t.status()) && !t.blockedBy().isEmpty()
+                    && !readyBefore.contains(t.id())) {
+                try { if (canStart(t.id())) unblocked.add(t.subject()); }
+                catch (Exception ignore) {}
+            }
+        }
+        String msg = "Completed " + updated.id() + " (" + updated.subject() + ")";
+        if (!unblocked.isEmpty()) {
+            msg += "\nUnblocked: " + String.join(", ", unblocked);
+        }
+        return msg;
+    } catch (Exception e) { return "Error: " + e.getMessage(); }
+}
 ```
 
-完成 "schema" 后，"endpoints" 和 "docs" 的 `can_start` 返回 True，它们可以开始。
+完成 "schema" 后，"endpoints" 和 "docs" 的 `canStart` 返回 `true`，它们可以开始。
 
 ### get_task: 查看完整细节
 
 `list_tasks` 只显示一行摘要。`get_task` 返回完整的任务 JSON，包括 description 和依赖细节。跨会话恢复时，Agent 需要读取完整描述才能继续工作：
 
-```python
-def get_task(task_id: str) -> str:
-    task = load_task(task_id)
-    return json.dumps(asdict(task), indent=2)
+```java
+private static String runGetTask(String taskId) {
+    try { return taskToJson(TASKS.load(taskId)); }
+    catch (Exception e) { return "Error: " + e.getMessage(); }
+}
+
+/** Task → 带缩进的 JSON (Jackson), 字段顺序与文件里一致 */
+private static String taskToJson(Task t) throws JsonProcessingException {
+    Map<String, Object> m = new LinkedHashMap<>();
+    m.put("id", t.id());
+    m.put("subject", t.subject());
+    m.put("description", t.description());
+    m.put("status", t.status());
+    m.put("owner", t.owner());
+    m.put("blockedBy", t.blockedBy());
+    return JSON_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(m);
+}
 ```
 
 ### 状态机: 两个动作，三个状态
@@ -164,35 +303,37 @@ pending ──claim──→ in_progress ──complete──→ completed
 
 这里的 `claim` / `complete` 是动作，`pending` / `in_progress` / `completed` 是状态：
 
-- **claim_task**: `pending` → `in_progress`。设置 owner，开始工作。
-- **complete_task**: `in_progress` → `completed`。把任务标记为完成，并解锁下游。
+- **claim_task**（`claimTask`）: `pending` → `in_progress`。设置 owner，开始工作。
+- **complete_task**（`completeTask`）: `in_progress` → `completed`。把任务标记为完成，并解锁下游。
 
 ### 合起来跑
 
-```python
-# 第一阶段：创建所有节点并取得运行时 ID
-schema = create_task("setup database schema")
-endpoints = create_task("create API endpoints")
-tests = create_task("write tests")
-docs = create_task("write docs")
+下面这段是示意（`AgentLoop.java` 里没有这个 demo 方法，实际由模型通过工具调用驱动），直接调用上面几个方法走一遍：
 
-# 第二阶段：使用返回的 ID 建立依赖边
-update_task(endpoints.id, addBlockedBy=[schema.id])
-update_task(tests.id, addBlockedBy=[endpoints.id])
-update_task(docs.id, addBlockedBy=[schema.id])
+```java
+// 第一阶段：创建所有节点并取得运行时 ID
+Task schema    = TASKS.create("setup database schema", "");
+Task endpoints = TASKS.create("create API endpoints", "");
+Task tests     = TASKS.create("write tests", "");
+Task docs      = TASKS.create("write docs", "");
 
-# Agent 认领第一个可做的任务
-claim_task(schema.id)       # ✓ Claimed (无依赖)
-complete_task(schema.id)    # ✓ Completed → 解锁 endpoints, docs
+// 第二阶段：使用返回的 ID 建立依赖边
+TASKS.updateDependencies(endpoints.id(), List.of(schema.id()));
+TASKS.updateDependencies(tests.id(),     List.of(endpoints.id()));
+TASKS.updateDependencies(docs.id(),      List.of(schema.id()));
 
-claim_task(endpoints.id)    # ✓ Claimed (schema 已完成)
-complete_task(endpoints.id) # ✓ Completed → 解锁 tests
+// Agent 认领第一个可做的任务
+claimTask(schema.id(), "agent");        // ✓ Claimed (无依赖)
+completeTask(schema.id(), "agent");     // ✓ Completed → 解锁 endpoints, docs (列表顺序按任务 ID 排序)
 
-claim_task(docs.id)         # ✓ Claimed (schema 已完成)
-complete_task(docs.id)      # ✓ Completed
+claimTask(endpoints.id(), "agent");     // ✓ Claimed (schema 已完成)
+completeTask(endpoints.id(), "agent");  // ✓ Completed → 解锁 tests
 
-claim_task(tests.id)        # ✓ Claimed (endpoints 已完成)
-complete_task(tests.id)     # ✓ Completed
+claimTask(docs.id(), "agent");          // ✓ Claimed (schema 已完成)
+completeTask(docs.id(), "agent");       // ✓ Completed
+
+claimTask(tests.id(), "agent");         // ✓ Claimed (endpoints 已完成)
+completeTask(tests.id(), "agent");      // ✓ Completed
 ```
 
 每个 `create_task` 写一个 JSON 文件，`update_task`、`claim_task` 和 `complete_task` 更新文件。跨会话时，`.tasks/` 目录还在，Agent 读文件就能恢复进度。
