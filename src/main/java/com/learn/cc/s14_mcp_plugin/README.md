@@ -1,7 +1,8 @@
 # s14: MCP Tools — 发现并调用外部工具
 
-> ℹ️ 本章正文代码片段沿用 Python 原版以突出机制；对应 Java 实现见同目录 `AgentLoop.java`。
-> s06 / s07 / s13 / s15 / s17 相比原版做了教学取舍，详见各自 `AgentLoop.java` 顶部注释。
+> ℹ️ 下面的代码片段摘自同目录 `AgentLoop.java`（有删减，完整可运行版见该文件）。
+> Java 版的 MCP handler 统一是 `Function<Map<String, Object>, String>`：参数以 Map 传入，
+> 而不是 Python 那样用 `**kwargs` 展开成关键字参数，所以参数校验要显式去做（见第 7 节）。
 
 [s04](../s04_hooks/) → `s14` → [s15](../s15_integrated_harness/) → s16 → s17
 
@@ -25,7 +26,7 @@ MCP 把这部分拆成两个角色：server 提供工具列表和调用入口，
 
 - `MCPClient` 保存 server 返回的工具定义和调用入口。
 - `connect_mcp` 连接一个 server，并取得它的工具列表。
-- `assemble_tool_pool` 把基础工具与已经连接的 MCP 工具组装到同一个工具池。
+- `assembleToolPool()` 把基础工具与已经连接的 MCP 工具组装到同一个工具池。
 
 课程里的 `docs` 和 `deploy` 是进程内模拟 server，用来展示 `tools/list`、`tools/call` 和动态工具池。真实 MCP transport 不在本章实现。
 
@@ -37,57 +38,106 @@ MCP 把这部分拆成两个角色：server 提供工具列表和调用入口，
 
 每轮调用模型前，Harness 组装当前工具池：
 
-```python
-def agent_loop(messages: list):
-    while True:
-        tools, handlers = assemble_tool_pool()
-        response = client.messages.create(
-            model=MODEL,
-            system=assemble_system_prompt(),
-            messages=messages,
-            tools=tools,
-            max_tokens=8000,
-        )
-        ...
+```java
+private static Message agentLoop(MessageCreateParams.Builder paramsBuilder, List<MessageParam> history) {
+    while (true) {
+        // 每轮重新组装工具池 (可能有新连接的 MCP server)
+        ToolPool pool = assembleToolPool();
+
+        MessageCreateParams.Builder pb = MessageCreateParams.builder()
+                .model(MODEL).system(assembleSystemPrompt())
+                .maxTokens(8000).temperature(0.3);
+        pool.tools().forEach(pb::addTool);
+        history.forEach(pb::addMessage);
+        Message response = CLIENT.messages().create(pb.build());
+        // ...
+    }
+}
+
+public record ToolPool(List<Tool> tools, Map<String, Function<Map<String, Object>, String>> handlers) {}
 ```
 
-连接新 server 后，下一轮 `assemble_tool_pool()` 会把新工具加入模型输入。工具执行后，结果仍作为 `tool_result` 追加到 messages。
+连接新 server 后，下一轮 `assembleToolPool()` 会把新工具加入模型输入；`assembleSystemPrompt()` 也会在系统提示词末尾追加 `Connected MCP servers: ...`。工具执行后，结果仍作为 `tool_result` 追加到 messages。
 
 ### 2. MCPClient 保存发现结果和调用入口
 
-```python
-class MCPClient:
-    def register(self, tool_defs, handlers):
-        self.tools = list(tool_defs)
-        self._handlers = dict(handlers)
+```java
+public record McpToolDef(String name, String description, Map<String, Object> inputSchema) {}
 
-    def call_tool(self, tool_name, args):
-        handler = self._handlers.get(tool_name)
-        if not handler:
-            return f"MCP error: unknown tool '{tool_name}'"
-        try:
-            return str(handler(**args))
-        except Exception as error:
-            return f"MCP error: {type(error).__name__}: {error}"
+@FunctionalInterface
+public interface McpHandler extends Function<Map<String, Object>, String> {}
+
+static final class MCPClient {
+    final String name;
+    final List<McpToolDef> tools = new ArrayList<>();
+    final Map<String, McpHandler> handlers = new LinkedHashMap<>();
+
+    /** 注册工具 + handlers, 校验一致性 */
+    void register(List<McpToolDef> toolDefs, Map<String, McpHandler> handlerMap) {
+        Set<String> names = new HashSet<>();
+        for (McpToolDef td : toolDefs) {
+            if (td.name() == null || td.name().isEmpty()) {
+                throw new IllegalArgumentException("Every MCP tool needs a non-empty name");
+            }
+            if (!names.add(td.name())) {
+                throw new IllegalArgumentException("Duplicate MCP tool name on server " + this.name);
+            }
+            if (!handlerMap.containsKey(td.name())) {
+                throw new IllegalArgumentException("Missing MCP handler: " + td.name());
+            }
+        }
+        this.tools.addAll(toolDefs);
+        this.handlers.putAll(handlerMap);
+    }
+
+    /** 运行时调用: 找到 handler, 校验参数, 执行, 返回字符串 */
+    String callTool(String toolName, Map<String, Object> args) {
+        McpHandler h = handlers.get(toolName);
+        if (h == null) return "MCP error: unknown tool '" + toolName + "'";
+        String argError = checkArgs(toolName, args);   // 见第 7 节
+        if (argError != null) return argError;
+        try {
+            return h.apply(args);
+        } catch (Exception e) {
+            return "MCP error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+        }
+    }
+}
 ```
 
-`register()` 对应课程里的工具发现结果，`call_tool()` 对应调用入口。错误会返回给模型，不会直接结束 Agent Loop。
+`register()` 对应课程里的工具发现结果，注册时会检查工具名非空、不重复、每个工具都有 handler；`callTool()` 对应调用入口。错误会返回给模型，不会直接结束 Agent Loop。工具定义里的 schema 字段沿用 MCP 协议的写法 `inputSchema`，组装工具池时才转换成 Anthropic SDK 的 `Tool.InputSchema`。
 
 ### 3. connect_mcp 只负责连接和发现
 
-```python
-def connect_mcp(name: str) -> str:
-    if name in mcp_clients:
-        return f"MCP server '{name}' already connected"
-    factory = MOCK_SERVERS.get(name)
-    if not factory:
-        return f"Unknown server '{name}'"
-    server = factory()
-    mcp_clients[name] = server
-    ...
+```java
+/** name → server 工厂 */
+private static final Map<String, Supplier<MCPClient>> MOCK_SERVERS = Map.of(
+        "docs", AgentLoop::mockServerDocs,
+        "deploy", AgentLoop::mockServerDeploy
+);
+
+/** 已连接的 MCP server (server_name → client) */
+private static final Map<String, MCPClient> MCP_CLIENTS = new LinkedHashMap<>();
+
+private static String runConnectMcp(String name) {
+    if (MCP_CLIENTS.containsKey(name)) {
+        return "MCP server '" + name + "' already connected";
+    }
+    Supplier<MCPClient> factory = MOCK_SERVERS.get(name);
+    if (factory == null) {
+        return "Unknown server '" + name + "'. Available: "
+                + String.join(", ", MOCK_SERVERS.keySet());
+    }
+    MCPClient server = factory.get();
+    MCP_CLIENTS.put(name, server);
+    String toolNames = server.tools.stream().map(McpToolDef::name)
+            .reduce((a, b) -> a + ", " + b).orElse("");
+    return "Connected to MCP server '" + name + "'. Discovered "
+            + server.tools.size() + " tools: " + toolNames;
+}
 ```
 
-开始时，模型只看到五个基础工具和 `connect_mcp`。调用 `connect_mcp(name="docs")` 后，Harness 保存 docs client。下一轮模型调用会看到：
+`connect_mcp` 工具的 `name` 参数在 schema 里用 `enum: ["docs", "deploy"]` 限定了可选值。开始时，模型只看到五个基础工具和 `connect_mcp`。调用 `connect_mcp(name="docs")` 后，Harness 保存 docs client。下一轮模型调用会看到：
 
 ```text
 mcp__docs__search
@@ -102,56 +152,139 @@ mcp__docs__get_version
 mcp__{server}__{tool}
 ```
 
-`normalize_mcp_name()` 把不适合模型工具名的字符替换为下划线。组装工具池时还会检查规范化后的名称冲突和 64 字符长度限制：
+`normalizeMcpName()` 把 `[a-zA-Z0-9_-]` 以外的字符替换为下划线。组装工具池时还会检查规范化后的名称冲突和 64 字符长度限制：
 
-```python
-prefixed = f"mcp__{safe_server}__{safe_tool}"
-if prefixed in origins:
-    raise ValueError("MCP tool name collision after normalization")
+```java
+private static final Pattern DISALLOWED_CHARS = Pattern.compile("[^a-zA-Z0-9_-]");
+
+private static String normalizeMcpName(String name) {
+    String normalized = DISALLOWED_CHARS.matcher(name).replaceAll("_");
+    if (normalized.isEmpty()) throw new IllegalArgumentException("MCP name normalizes to empty");
+    return normalized;
+}
+
+// assembleToolPool() 里, 对每个已连接 server 的每个工具:
+String prefixed = "mcp__" + safeServer + "__" + safeTool;
+if (prefixed.length() > 64) {
+    throw new IllegalArgumentException("MCP tool name longer than 64 chars: " + prefixed);
+}
+String origin = "MCP tool '" + serverName + "/" + rawName + "'";
+if (origins.containsKey(prefixed)) {
+    throw new IllegalArgumentException("MCP tool name collision after normalization: "
+            + prefixed + " maps both " + origins.get(prefixed) + " and " + origin);
+}
 ```
+
+`origins` 一开始就登记了所有内置工具名，所以 MCP 工具也不能规范化成和内置工具同名。
 
 因此 `docs.one/get.version` 和 `docs_one/get_version` 不会悄悄映射到同一个名字。
 
 ### 5. 工具定义和 handler 一起加入工具池
 
-```python
-tools.append({
-    "name": prefixed,
-    "description": tool_def.get("description", ""),
-    "input_schema": schema,
-})
-handlers[prefixed] = (
-    lambda *, client=server, tool=raw_name, **kwargs:
-    client.call_tool(tool, kwargs)
-)
+```java
+// 用 Anthropic Tool.builder + JsonValue.from 把 MCP schema 转成 SDK Tool
+Tool.InputSchema.Builder isb = Tool.InputSchema.builder()
+        .properties(JsonValue.from(schema.getOrDefault("properties", Map.of())));
+Object required = schema.get("required");
+if (required != null) isb.putAdditionalProperty("required", JsonValue.from(required));
+tools.add(Tool.builder()
+        .name(prefixed)
+        .description(td.description() == null ? "" : td.description())
+        .inputSchema(isb.build())
+        .build());
+
+// handler: 闭包捕获 server + rawName, dispatch 到 server.callTool
+MCPClient serverRef = server;
+String toolNameRef = rawName;
+handlers.put(prefixed, args -> serverRef.callTool(toolNameRef, args));
+
+// 授权策略 (见第 6 节)
+String policy = MCP_HOST_POLICY.getOrDefault(new ServerToolKey(serverName, rawName), "confirm");
+MCP_TOOL_POLICIES.put(prefixed, policy);
 ```
 
-模型看到带前缀的名字；handler 仍使用 server 原始工具名调用 `MCPClient`。默认参数保存当前 client 和 tool，避免循环里的 lambda 全部指向最后一个工具。
+模型看到带前缀的名字；handler 仍使用 server 原始工具名调用 `MCPClient`。Python 原版要用 lambda 默认参数保存当前 client 和 tool，避免循环里的 lambda 全部指向最后一个工具；Java 的 lambda 只能捕获 effectively final 的局部变量，每次循环迭代都是新的 `serverRef` / `toolNameRef`，天然没有这个问题。
 
 ### 6. 权限由宿主配置决定
 
 MCP server 可以提供 `readOnlyHint` 或 `destructiveHint`，但这些信息来自 server，不能直接作为授权依据。本章使用宿主侧策略：
 
-```python
-MCP_HOST_POLICY = {
-    ("docs", "search"): "allow",
-    ("docs", "get_version"): "allow",
-    ("deploy", "status"): "allow",
-    ("deploy", "trigger"): "confirm",
+```java
+private record ServerToolKey(String serverName, String toolName) {}
+private static final Map<ServerToolKey, String> MCP_HOST_POLICY = Map.of(
+        new ServerToolKey("docs", "search"), "allow",
+        new ServerToolKey("docs", "get_version"), "allow",
+        new ServerToolKey("deploy", "status"), "allow",
+        new ServerToolKey("deploy", "trigger"), "confirm"    // 破坏性, 要用户确认
+);
+```
+
+组装工具池时，每个 MCP 工具的策略按 `(server 原名, tool 原名)` 查出来，存进以前缀名为键的 `MCP_TOOL_POLICIES`；`permissionHook()` 再按模型调用的前缀名查这张表。未配置的外部工具默认需要用户确认：
+
+```java
+if (name.startsWith("mcp__")) {
+    String policy = MCP_TOOL_POLICIES.getOrDefault(name, "confirm");
+    if (!"allow".equals(policy)) {
+        System.out.println("\n\033[33m[permission] External tool " + name + "(" + input + ")\033[0m");
+        System.out.print("Allow? [y/N] ");
+        String choice = USER_INPUT.hasNextLine() ? USER_INPUT.nextLine().trim().toLowerCase() : "";
+        if (!(choice.equals("y") || choice.equals("yes"))) {
+            return "Permission denied by user";
+        }
+    }
 }
 ```
 
-`permission_hook()` 根据规范化后的工具名查询这份策略。未配置的外部工具默认需要用户确认；即使 description 写着 `readOnly`，也不会自动放行。
+Java 版的 `McpToolDef` 根本没有 `readOnlyHint` / `destructiveHint` 这类字段，授权只看宿主配置；即使 description 写着 `readOnly`，也不会自动放行。
 
 ### 7. 工具输入错误留在工具边界内
 
-模型可能漏传参数，也可能传入 server 不接受的字段。`execute_tool()` 和 `MCPClient.call_tool()` 都会捕获异常，并返回错误 `tool_result`：
+模型可能漏传参数，也可能传入 server 不接受的字段。Python 原版里，`handler(**args)` 遇到这两种情况会自己抛 `TypeError`。Java 的 handler 收的是 Map，漏传的参数 `get` 出来是 `null`，多传的参数直接被忽略，所以 `MCPClient` 按工具的 `inputSchema` 显式检查：
 
-```text
-MCP error: TypeError: <lambda>() missing 1 required argument: 'query'
+```java
+private String checkArgs(String toolName, Map<String, Object> args) {
+    McpToolDef def = tools.stream().filter(t -> t.name().equals(toolName)).findFirst().orElse(null);
+    if (def == null || def.inputSchema() == null) return null;
+    Object props = def.inputSchema().getOrDefault("properties", Map.of());
+    Object required = def.inputSchema().getOrDefault("required", List.of());
+    if (required instanceof List<?> req) {
+        for (Object r : req) {
+            if (!args.containsKey(String.valueOf(r))) {
+                return "MCP error: " + toolName + " missing required argument '" + r + "'";
+            }
+        }
+    }
+    if (props instanceof Map<?, ?> p) {
+        for (String key : args.keySet()) {
+            if (!p.containsKey(key)) {
+                return "MCP error: " + toolName + " got an unexpected argument '" + key + "'";
+            }
+        }
+    }
+    return null;
+}
 ```
 
-模型可以在下一轮修正参数，而不是让课程脚本直接退出。
+内置工具的参数缺失或类型不对时，会抛出 `NullPointerException` / `ClassCastException`。Agent Loop 调用 handler 时把它们接住，作为 `tool_result` 返回（对应 Python `execute_tool()` 里的 `try/except`）：
+
+```java
+try {
+    output = handler == null
+            ? "Unknown tool: " + tb.name()
+            : handler.apply(input);
+} catch (Exception e) {
+    output = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+}
+```
+
+模型收到的是这样的错误结果：
+
+```text
+MCP error: search missing required argument 'query'
+Error: NullPointerException: null
+```
+
+模型可以在下一轮修正参数，而不是让课程程序直接退出。
 
 ---
 
@@ -161,7 +294,7 @@ MCP error: TypeError: <lambda>() missing 1 required argument: 'query'
 |---|---|---|
 | 基础工具 | 五个固定工具 | 保持不变 |
 | 工具来源 | `AgentLoop.java` 中的定义 | 基础工具加动态发现的 MCP 工具 |
-| 工具池 | 固定 `TOOLS` | 每轮由 `assemble_tool_pool()` 组装 |
+| 工具池 | 固定 `TOOLS` | 每轮由 `assembleToolPool()` 组装 |
 | 外部工具名 | 无 | `mcp__{server}__{tool}` |
 | 权限 | Shell 和路径检查 | 增加宿主侧 MCP 策略 |
 | MCP transport | 无 | 使用进程内模拟 server 展示协议边界 |
