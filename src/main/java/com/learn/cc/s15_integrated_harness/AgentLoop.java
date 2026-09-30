@@ -41,7 +41,9 @@ import java.util.Optional;
 import java.util.Scanner;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
@@ -82,7 +84,7 @@ import java.util.stream.Stream;
  *   │             │
  *   │        [s04] PreToolUse hook (permission)
  *   │        [s03] 硬拒绝列表
- *   │        [s14] MCP host policy
+ *   │        [s14] MCP host policy (Java 版未实现, MCP 工具全部放行)
  *   │             │
  *   │        工具执行 (s02 基础 + s07 load_skill + s10 task + s11 bg + s12 cron
  *   │                  + s13 team + s14 MCP + s09 memory)
@@ -94,12 +96,12 @@ import java.util.stream.Stream;
  *   │             │
  *   │        stop_reason != tool_use → [s04] Stop hook → return
  *   │             │
- *   │        [s09] memory extract + consolidate
+ *   │        [s09] memory extract + consolidate (Java 版未实现, 只有关键词 recall)
  *   └─ 打印结果 ──┘
  *
  * 教学取舍:
  *   ✓ 保留骨架: skill / memory / task / bg / cron / team / MCP / hooks / compact
- *   ✗ 简化: memory 用最小 recall/extract, compact 只做 char 阈值裁剪
+ *   ✗ 简化: memory 只做关键词 recall (无 extract), compact 只做 char 阈值裁剪
  *   ✗ 省略: git worktree, plan version, subprocess 进程组, 完善的错误回滚
  *
  * 建议对照阅读: s07/s09/s10/s11/s12/s13/s14 的实现, s15 就是把它们
@@ -552,8 +554,11 @@ public final class AgentLoop {
                 Map<String, Object> msg = new LinkedHashMap<>();
                 msg.put("from", from); msg.put("to", to); msg.put("content", content);
                 msg.put("type", type); msg.put("metadata", meta == null ? Map.of() : meta);
+                // 必须写成单行: JSON_MAPPER 全局开了 INDENT_OUTPUT, 直接 writeValueAsString 会输出多行 JSON,
+                // 破坏 jsonl "一行一条消息" 的格式, readInbox 逐行解析会全部失败, 消息被静默丢弃
                 Files.writeString(MAILBOX_DIR.resolve(to + ".jsonl"),
-                        JSON_MAPPER.writeValueAsString(msg) + "\n",
+                        JSON_MAPPER.writer().without(SerializationFeature.INDENT_OUTPUT)
+                                .writeValueAsString(msg) + "\n",
                         java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
                 changed.signalAll();
                 System.out.println("  \033[36m[bus]\033[0m " + from + " -> " + to + " (" + type + ")");
@@ -700,10 +705,27 @@ public final class AgentLoop {
         return total;
     }
 
+    private static boolean isToolResultMsg(MessageParam m) {
+        return m.role() == MessageParam.Role.USER && m.content().blockParams().isPresent()
+                && m.content().blockParams().get().stream().anyMatch(b -> b.toolResult().isPresent());
+    }
+
+    private static boolean hasToolUse(MessageParam m) {
+        return m.role() == MessageParam.Role.ASSISTANT && m.content().blockParams().isPresent()
+                && m.content().blockParams().get().stream().anyMatch(b -> b.toolUse().isPresent());
+    }
+
     private static List<MessageParam> maybeCompact(List<MessageParam> history) {
         if (estimateChars(history) <= COMPACT_THRESHOLD || history.size() <= 10) return history;
         // 极简: 保留头 3 + 尾 5, 中间替换成一条 "[N messages elided by compaction]"
         int head = 3, tailStart = history.size() - 5;
+        // 切口不能把 tool_use 和它的 tool_result 拆开 (对齐 s08 snipCompact):
+        // 拆开后 API 会拒绝这段历史 (tool_result 找不到对应 tool_use, 或 tool_use 后面没有 tool_result),
+        // 而且坏掉的历史会留在 history 里, 之后每一轮调用都会失败
+        if (hasToolUse(history.get(head - 1))) {
+            while (head < tailStart && isToolResultMsg(history.get(head))) head++;
+        }
+        if (isToolResultMsg(history.get(tailStart)) && hasToolUse(history.get(tailStart - 1))) tailStart--;
         if (head >= tailStart) return history;
         List<MessageParam> out = new ArrayList<>(history.subList(0, head));
         out.add(MessageParam.builder().role(MessageParam.Role.USER)
@@ -1056,16 +1078,22 @@ public final class AgentLoop {
                 // (g) [s04] PreToolUse hook: permission
                 String blocked = permissionCheck(tb, input);
                 String output;
-                if (blocked != null) {
-                    output = blocked;
-                } else if ("bash".equals(tb.name()) && Boolean.TRUE.equals(input.get("run_in_background"))) {
-                    // ★ [s11] background bash: 特殊处理
-                    output = "Background task " + bgStart(tb, (String) input.get("command"))
-                            + " started. Result arrives as <task_notification>.";
-                } else {
-                    // 普通分发
-                    var handler = pool.handlers().get(tb.name());
-                    output = handler == null ? "Unknown tool: " + tb.name() : handler.apply(input);
+                // 工具输入错误要留在工具边界内: 参数缺失或类型不对会抛 NPE / ClassCastException,
+                // 不接住的话会一路冒出 agentLoop 把整个程序打崩; 接住后作为 tool_result 返回, 模型下一轮可以修正
+                try {
+                    if (blocked != null) {
+                        output = blocked;
+                    } else if ("bash".equals(tb.name()) && Boolean.TRUE.equals(input.get("run_in_background"))) {
+                        // ★ [s11] background bash: 特殊处理
+                        output = "Background task " + bgStart(tb, (String) input.get("command"))
+                                + " started. Result arrives as <task_notification>.";
+                    } else {
+                        // 普通分发
+                        var handler = pool.handlers().get(tb.name());
+                        output = handler == null ? "Unknown tool: " + tb.name() : handler.apply(input);
+                    }
+                } catch (Exception e) {
+                    output = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
                 }
                 System.out.println(output.length() > 200 ? output.substring(0, 200) : output);
 
@@ -1117,8 +1145,72 @@ public final class AgentLoop {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  15. 入口: 启动 cron 后台线程, 主循环等 stdin 或 mailbox
+    //  15. 入口: 启动 cron 后台线程, 主循环同时等 "用户输入" 和 "三种异步事件"
+    //
+    //  三种异步事件: cron 到点 (CRON_QUEUE) / 后台 bash 完成 (BG_READY) / 队友消息 (lead 收件箱)。
+    //  Scanner.nextLine() 只能阻塞读, 所以和 s13 一样拆成两半:
+    //    - stdin-reader 守护线程: 专门阻塞读 stdin, 每读到一行就放进 CLI_INPUT 队列
+    //    - 主线程: 先看有没有异步事件, 再用 poll(250ms) 等队列; 超时就回去看事件
+    //  这样 "3 分钟后提醒我开会" 到点后, 不用用户输入也会自动开一轮。
     // ══════════════════════════════════════════════════════════════════
+
+    /** 主循环等到的事件: wake = 有异步事件待交付; user = 用户输入了一行; quit = stdin 结束 */
+    private record CliEvent(String kind, String line) {}
+
+    /** stdin-reader 线程 → 主线程。Optional.empty() 表示 stdin 已到 EOF */
+    private static final BlockingQueue<Optional<String>> CLI_INPUT = new LinkedBlockingQueue<>();
+
+    private static void startStdinReader() {
+        Thread reader = new Thread(() -> {
+            while (USER_INPUT.hasNextLine()) CLI_INPUT.add(Optional.of(USER_INPUT.nextLine()));
+            CLI_INPUT.add(Optional.empty());
+        }, "stdin-reader");
+        reader.setDaemon(true);
+        reader.start();
+    }
+
+    /** 只看不取: agentLoop 开头才真正 consume 这三类事件 */
+    private static boolean hasPendingEvents() {
+        CRON_LOCK.lock();
+        try { if (!CRON_QUEUE.isEmpty()) return true; } finally { CRON_LOCK.unlock(); }
+        BG_LOCK.lock();
+        try { if (!BG_READY.isEmpty()) return true; } finally { BG_LOCK.unlock(); }
+        return BUS.peek("lead");
+    }
+
+    private static CliEvent waitForCliEvent() {
+        boolean promptVisible = false;
+        while (true) {
+            if (hasPendingEvents()) {
+                if (promptVisible) System.out.println();
+                return new CliEvent("wake", null);
+            }
+            if (!promptVisible) {
+                System.out.print("\033[36ms15v >> \033[0m");
+                System.out.flush();
+                promptVisible = true;
+            }
+            Optional<String> line;
+            try { line = CLI_INPUT.poll(250, TimeUnit.MILLISECONDS); }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return new CliEvent("quit", null);
+            }
+            if (line == null) continue;                              // 超时: 回去看异步事件
+            if (line.isEmpty()) return new CliEvent("quit", null);   // stdin EOF
+            return new CliEvent("user", line.get());
+        }
+    }
+
+    private static void runTurn(List<MessageParam> history, String activeRequest) {
+        AGENT_LOCK.lock();
+        try {
+            Message r = agentLoop(history, activeRequest);
+            if (r != null) for (ContentBlock cb : r.content())
+                cb.text().ifPresent(t -> System.out.println(t.text()));
+            System.out.println();
+        } finally { AGENT_LOCK.unlock(); }
+    }
 
     public static void main(String[] args) {
         if (MODEL == null || MODEL.isBlank()) { System.err.println("MODEL_ID missing"); System.exit(1); }
@@ -1138,41 +1230,30 @@ public final class AgentLoop {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> CRON_STOP.set(true)));
 
         List<MessageParam> history = new ArrayList<>();
+        String lastRequest = "";   // 唤醒轮次没有新的用户输入, memory recall 沿用上一条用户请求
+        startStdinReader();
 
         while (true) {
-            System.out.print("\033[36ms15v >> \033[0m");
-            // 输入之前先看有没有 lead 邮箱消息
-            if (BUS.peek("lead")) {
-                AGENT_LOCK.lock();
-                try {
-                    List<Map<String, Object>> inbox = consumeLeadInbox();
-                    if (!inbox.isEmpty()) {
-                        history.add(MessageParam.builder().role(MessageParam.Role.USER)
-                                .content(formatTeamEvents(inbox)).build());
-                        System.out.println("\n[wake: " + inbox.size() + " team event(s)]");
-                        Message r = agentLoop(history, "team events");
-                        if (r != null) for (ContentBlock cb : r.content())
-                            cb.text().ifPresent(t -> System.out.println(t.text()));
-                        System.out.println();
-                    }
-                } finally { AGENT_LOCK.unlock(); }
+            CliEvent event = waitForCliEvent();
+            if ("quit".equals(event.kind())) break;
+
+            if ("wake".equals(event.kind())) {
+                // cron / 后台 / 队友事件到达: 不等用户输入, 直接开一轮。
+                // 事件本身由 agentLoop 开头的 bgCollect / consumeCronQueue / consumeLeadInbox 注入 history
+                System.out.println("[wake: pending cron / background / team events -> new turn]");
+                runTurn(history, lastRequest);
                 continue;
             }
-            if (!USER_INPUT.hasNextLine()) break;
-            String q = USER_INPUT.nextLine().trim();
+
+            String q = event.line().trim();
             if (q.isEmpty() || q.equalsIgnoreCase("q") || q.equalsIgnoreCase("exit")) break;
 
             // (前置) [s04] UserPromptSubmit hook
             System.out.println("\033[90m[hook] UserPromptSubmit: " + q.substring(0, Math.min(40, q.length())) + "\033[0m");
 
-            AGENT_LOCK.lock();
-            try {
-                history.add(MessageParam.builder().role(MessageParam.Role.USER).content(q).build());
-                Message r = agentLoop(history, q);
-                if (r != null) for (ContentBlock cb : r.content())
-                    cb.text().ifPresent(t -> System.out.println(t.text()));
-                System.out.println();
-            } finally { AGENT_LOCK.unlock(); }
+            lastRequest = q;
+            history.add(MessageParam.builder().role(MessageParam.Role.USER).content(q).build());
+            runTurn(history, q);
         }
         CRON_STOP.set(true);
         System.out.println("[shutting down]");
