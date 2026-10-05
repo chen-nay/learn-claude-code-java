@@ -18,9 +18,11 @@ import com.fasterxml.jackson.databind.json.JsonMapper;
 import io.github.cdimascio.dotenv.Dotenv;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -105,12 +107,22 @@ public final class AgentLoop {
                     .redirectErrorStream(true)
                     .start();
 
+            // 边跑边读输出: 如果先 waitFor 再读, 输出一旦超过管道缓冲区 (macOS 上约 64KB),
+            // 子进程就会阻塞在写管道上永远结束不了, 最后被 120s 超时误杀
+            InputStream stdout = p.getInputStream();
+            CompletableFuture<byte[]> output = CompletableFuture.supplyAsync(() -> {
+                try { return stdout.readAllBytes(); } catch (IOException e) { return new byte[0]; }
+            });
+
             boolean finished = p.waitFor(120, TimeUnit.SECONDS);
             if (!finished) {
+                // 先杀子孙进程, 再杀 shell。顺序不能反: shell 一死, 它的子进程就被 init 收养,
+                // 之后 p.descendants() 沿父子关系再也找不到它们, 子进程会在后台残留
+                p.descendants().forEach(ProcessHandle::destroyForcibly);
                 p.destroyForcibly();
                 return "Error: Timeout (120s)";
             }
-            String out = new String(p.getInputStream().readAllBytes()).trim();
+            String out = new String(output.join()).trim();
             if (out.isEmpty()) {
                 return "(no output)";
             }
@@ -155,9 +167,16 @@ public final class AgentLoop {
     }
 
     private static ContentBlockParam executeToolCall(ToolUseBlock block) {
-        String command = extractCommand(block);
-        System.out.println("\033[33m$ " + command + "\033[0m");
-        String output = runBash(command);
+        // 工具输入错误要留在工具边界内: 模型漏传 command 或传成非字符串时, extractCommand 会抛
+        // NPE / 异常, 不接住的话会一路冒出 agentLoop 把整个程序打崩; 接住后作为 tool_result 返回, 模型下一轮可以修正
+        String output;
+        try {
+            String command = extractCommand(block);
+            System.out.println("\033[33m$ " + command + "\033[0m");
+            output = runBash(command);
+        } catch (Exception e) {
+            output = "Error: invalid tool input: " + e.getMessage();
+        }
         System.out.println(output.length() > 200 ? output.substring(0, 200) : output);
 
         return ContentBlockParam.ofToolResult(ToolResultBlockParam.builder()
@@ -169,7 +188,12 @@ public final class AgentLoop {
     @SuppressWarnings("unchecked")
     private static String extractCommand(ToolUseBlock block) {
         Map<String, JsonValue> input = (Map<String, JsonValue>) block._input().asObject().get();
-        return input.get("command").asStringOrThrow();
+        JsonValue command = input.get("command");
+        if (command == null) throw new IllegalArgumentException("missing required argument 'command'");
+        if (!(command.asString().orElse(null) instanceof String s)) {
+            throw new IllegalArgumentException("argument 'command' must be a string");
+        }
+        return s;
     }
 
     // ── Entry point ───────────────────────────────────────────────────────
