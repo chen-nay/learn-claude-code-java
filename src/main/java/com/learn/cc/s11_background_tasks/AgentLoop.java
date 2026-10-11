@@ -23,6 +23,7 @@ import io.github.cdimascio.dotenv.Dotenv;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -37,6 +38,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Scanner;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
@@ -140,6 +142,12 @@ public final class AgentLoop {
                     .redirectErrorStream(true)
                     .start();
             LIVE_PROCESSES.add(p);
+            // 边跑边读输出: 如果先 waitFor 再读, 输出一旦超过管道缓冲区 (macOS 上约 64KB),
+            // 子进程就会阻塞在写管道上永远结束不了, 最后被超时误杀
+            InputStream stdout = p.getInputStream();
+            CompletableFuture<byte[]> outputFuture = CompletableFuture.supplyAsync(() -> {
+                try { return stdout.readAllBytes(); } catch (IOException e) { return new byte[0]; }
+            });
             boolean finished = p.waitFor(120, TimeUnit.SECONDS);
             if (!finished) {
                 // 先杀子孙进程, 再杀 shell。顺序不能反: shell 一死, 它的子进程就被 init 收养,
@@ -149,7 +157,7 @@ public final class AgentLoop {
                 p.destroyForcibly();
                 return new BashResult("Error: Timeout (120s)", null);
             }
-            String out = new String(p.getInputStream().readAllBytes()).trim();
+            String out = new String(outputFuture.join()).trim();
             String output = out.isEmpty() ? "(no output)"
                     : (out.length() > 50_000 ? out.substring(0, 50_000) : out);
             return new BashResult(output, p.exitValue());

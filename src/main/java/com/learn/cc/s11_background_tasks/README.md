@@ -141,6 +141,11 @@ private static BashResult runBashProcess(String command) {
                 .redirectErrorStream(true)
                 .start();
         LIVE_PROCESSES.add(p);
+        // 边跑边读输出: 先 waitFor 再读的话, 输出超过管道缓冲区 (约 64KB) 时子进程会卡在写管道上, 被超时误杀
+        InputStream stdout = p.getInputStream();
+        CompletableFuture<byte[]> outputFuture = CompletableFuture.supplyAsync(() -> {
+            try { return stdout.readAllBytes(); } catch (IOException e) { return new byte[0]; }
+        });
         boolean finished = p.waitFor(120, TimeUnit.SECONDS);
         if (!finished) {
             // 先杀子孙进程, 再杀 shell (顺序见下文)
@@ -148,7 +153,7 @@ private static BashResult runBashProcess(String command) {
             p.destroyForcibly();
             return new BashResult("Error: Timeout (120s)", null);
         }
-        String out = new String(p.getInputStream().readAllBytes()).trim();
+        String out = new String(outputFuture.join()).trim();
         // ... 空输出 → "(no output)", 超过 50_000 字符截断
         return new BashResult(output, p.exitValue());
     } catch (IOException | InterruptedException e) {
