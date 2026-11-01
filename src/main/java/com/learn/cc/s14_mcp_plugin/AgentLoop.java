@@ -153,11 +153,40 @@ public final class AgentLoop {
         String callTool(String toolName, Map<String, Object> args) {
             McpHandler h = handlers.get(toolName);
             if (h == null) return "MCP error: unknown tool '" + toolName + "'";
+            String argError = checkArgs(toolName, args);
+            if (argError != null) return argError;
             try {
                 return h.apply(args);
             } catch (Exception e) {
                 return "MCP error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
             }
+        }
+
+        /**
+         * 按工具的 inputSchema 检查参数: 缺 required 或多出未声明的字段都返回错误。
+         * Python 的 handler(**args) 遇到这两种情况会自己抛 TypeError; Java 的 handler 收的是 Map,
+         * 缺的参数 get 出来是 null、多的参数直接被忽略, 不显式检查的话模型拿不到"参数错了"的反馈。
+         */
+        private String checkArgs(String toolName, Map<String, Object> args) {
+            McpToolDef def = tools.stream().filter(t -> t.name().equals(toolName)).findFirst().orElse(null);
+            if (def == null || def.inputSchema() == null) return null;
+            Object props = def.inputSchema().getOrDefault("properties", Map.of());
+            Object required = def.inputSchema().getOrDefault("required", List.of());
+            if (required instanceof List<?> req) {
+                for (Object r : req) {
+                    if (!args.containsKey(String.valueOf(r))) {
+                        return "MCP error: " + toolName + " missing required argument '" + r + "'";
+                    }
+                }
+            }
+            if (props instanceof Map<?, ?> p) {
+                for (String key : args.keySet()) {
+                    if (!p.containsKey(key)) {
+                        return "MCP error: " + toolName + " got an unexpected argument '" + key + "'";
+                    }
+                }
+            }
+            return null;
         }
     }
 
@@ -564,9 +593,16 @@ public final class AgentLoop {
                     output = blocked;
                 } else {
                     Function<Map<String, Object>, String> handler = pool.handlers().get(tb.name());
-                    output = handler == null
-                            ? "Unknown tool: " + tb.name()
-                            : handler.apply(input);
+                    // 工具输入错误要留在工具边界内 (对应 Python execute_tool 的 try/except):
+                    // 内置工具的参数缺失或类型不对会抛 NPE / ClassCastException, 不接住的话会一路
+                    // 冒出 agentLoop 把整个程序打崩; 接住后作为 tool_result 返回, 模型下一轮可以修正参数
+                    try {
+                        output = handler == null
+                                ? "Unknown tool: " + tb.name()
+                                : handler.apply(input);
+                    } catch (Exception e) {
+                        output = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+                    }
                 }
                 System.out.println(output.length() > 200 ? output.substring(0, 200) : output);
                 results.add(ContentBlockParam.ofToolResult(ToolResultBlockParam.builder()

@@ -1,7 +1,9 @@
 # s15: Agent Harness 集成 — 多种机制，一个循环
 
-> ℹ️ 本章正文代码片段沿用 Python 原版以突出机制；对应 Java 实现见同目录 `AgentLoop.java`。
-> s06 / s07 / s13 / s15 / s17 相比原版做了教学取舍，详见各自 `AgentLoop.java` 顶部注释。
+> ℹ️ 下面的代码片段摘自同目录 `AgentLoop.java`（有删减，完整可运行版见该文件）。
+> 本章 Java 版是**整合示范**：Python 原版约 3300 行，是把前面所有能力完整集成的运行时；Java 版约 1300 行，
+> 只把每个机制的最小骨架挂到同一个循环上，让你看清多种机制如何在同一个 `while (true)` 里协同。
+> 正文按 Java 的实际功能来写，每一节末尾的「和 Python 原版的差别」列出没有带过来的部分。
 
 s01 → ... → s13 → [s14](../s14_mcp_plugin/) → `s15` → [s16](../s16_workflow_runtime/) → s17
 
@@ -35,44 +37,46 @@ S15 不再引入一个独立机制，而是展示现有机制从哪里进入模�
 
 ![System Architecture](images/system-architecture.svg)
 
-S15 不再引入新机制，而是把前面各章的组件集成到同一个 harness：
+S15 不再引入新机制，而是把前面各章的组件集成到同一个 harness。Java 版一轮的顺序是：
 
 ```text
-用户输入
-  → UserPromptSubmit hooks
-  → cron/background 通知注入
-  → context compact
-  → memory + skills + MCP 状态组装 system prompt
+用户输入（或 cron / 后台 / 队友事件自动唤醒）
+  → [hook] UserPromptSubmit（只打印一行日志）
+  → 后台通知 + cron prompt + team events 注入 messages
+  → compact（字符阈值，保头保尾）
+  → memory recall + skills catalog + MCP 状态组装 system prompt
+  → 每轮重新组装工具池（内置工具 + 已连接的 MCP 工具）
   → LLM
-  → has tool_use block?
-      否 → Stop hooks → 返回
-      是 → PreToolUse hooks + permission
-          → TOOL_HANDLERS / MCP handlers / background dispatch
-          → PostToolUse hooks
-          → tool_result / task_notification 回 messages
-          → 下一轮
+  → stop_reason == tool_use?
+      否 → [hook] Stop（只打印一行日志）→ 返回
+      是 → permissionCheck（bash deny-list）
+          → 后台 bash / 工具池 handler（含 mcp__ 工具）
+          → [hook] PostToolUse（大输出告警）
+          → todo reminder
+          → tool_result 回 messages → 下一轮
 ```
 
-循环仍是同一个结构：调用模型，检查响应里是否出现 `tool_use` block，执行工具，再把结果追加回 `messages`。是否继续工具轮，由响应中有没有实际的 `tool_use` block 决定。
+循环仍是同一个结构：调用模型，检查是否需要执行工具，执行工具，再把结果追加回 `messages`。Java 版用响应的 `stop_reason` 是否为 `tool_use` 决定是否继续工具轮。
 
 ---
 
 ## 组件在循环中的位置
 
-| 位置 | 组件 | 作用 |
+| 位置 | 组件 | Java 版的作用 |
 |------|------|------|
-| 用户输入前后 | `UserPromptSubmit` hooks | 记录、注入、审计用户输入 |
-| LLM 前 | cron queue | 把定时触发的 prompt 注入 `messages` |
-| LLM 前 | background notifications | 后台任务完成后以 `<task_notification>` 注入 |
-| LLM 前 | compaction pipeline | 先压大输出，再裁历史，再压旧 tool_result，必要时摘要 |
-| LLM 前 | memory / skills / MCP state | 组装 system prompt，让模型看到当前能力和长期上下文 |
-| LLM 调用 | error recovery | 429/529 重试，`max_tokens` 升级，prompt too long 触发 reactive compact |
-| 工具执行前 | `PreToolUse` hooks + permission | 拦截危险命令、写越界、破坏性 MCP 工具 |
-| 工具分发 | `assemble_tool_pool` | 组装内置工具和 MCP 动态工具 |
-| 工具执行时 | background dispatch | 显式标记的 bash 操作放入 daemon thread，主循环先返回占位结果 |
-| 工具执行后 | `PostToolUse` hooks | 大输出告警、日志等后处理 |
-| 返回循环 | tool_result | 每个 `tool_use` 对应一个 `tool_result`，再回到下一轮 |
-| 本轮没有 tool_use / 停止时 | `Stop` hooks | 统计、清理、审计 |
+| 用户输入后 | `UserPromptSubmit` hook | 打印一行日志（没有可注册的 hook 框架） |
+| LLM 前 | background notifications | 已完成的后台 bash 以 `<task_notification>` 注入 |
+| LLM 前 | cron queue | 到点的 prompt 以 `[Scheduled] ...` 注入 |
+| LLM 前 | team events | Lead 收件箱里的队友消息以 `[Team events]` 注入 |
+| LLM 前 | compaction | 估算字符数超过 40,000 且消息超过 10 条时，保头保尾、中间换成一条占位消息 |
+| LLM 前 | memory / skills / MCP state | 组装 system prompt |
+| LLM 调用 | 错误处理 | 调用抛异常就打印错误、结束本轮；只依赖 SDK 客户端自带的自动重试 |
+| 工具执行前 | `permissionCheck` | bash 命令命中 deny-list 就拒绝 |
+| 工具分发 | `assembleToolPool()` | 每轮组装内置工具和 MCP 动态工具 |
+| 工具执行时 | background dispatch | `run_in_background=true` 的 bash 放进 daemon 线程，先返回占位结果 |
+| 工具执行后 | `PostToolUse` hook | 输出超过 100,000 字符时打印告警 |
+| 工具执行后 | todo reminder | 连续 3 轮没调用 `todo_write` 就追加 `<reminder>` |
+| 本轮没有 tool_use | `Stop` hook | 打印一行日志 |
 
 ---
 
@@ -80,134 +84,261 @@ S15 不再引入新机制，而是把前面各章的组件集成到同一个 har
 
 ### 工具与分发
 
-内置工具池包含 26 个工具：
+内置工具池包含 15 个工具：
 
 ```text
 bash, read_file, write_file, edit_file, glob
-todo_write, task, load_skill, compact
-create_task, update_task, list_tasks, get_task, claim_task, complete_task
-schedule_cron, list_crons, cancel_cron
-spawn_teammate, list_teammates, send_message
-request_shutdown, request_plan, review_plan
-create_worktree
+todo_write, load_skill
+create_task, list_tasks, claim_task, complete_task
+schedule_cron
+spawn_teammate, list_teammates
 connect_mcp
 ```
 
-`assemble_tool_pool()` 每轮组装：
+`assembleToolPool()` 每轮组装内置工具和 handler，再把已连接 MCP server 的工具加进去：
 
-```text
-BUILTIN_TOOLS + connected MCP tools
-BUILTIN_HANDLERS + mcp__server__tool handlers
+```java
+private static ToolPool assembleToolPool() {
+    List<Tool> tools = new ArrayList<>(BUILTIN_TOOLS);
+    Map<String, Function<Map<String, Object>, String>> handlers = new LinkedHashMap<>();
+    handlers.put("bash", args -> runBash((String) args.get("command")));
+    handlers.put("read_file", args -> runRead((String) args.get("path"), asInt(args.get("limit"))));
+    // ... 其余 13 个内置工具
+
+    // MCP 工具动态加入
+    for (Map.Entry<String, MCPClient> e : MCP_CLIENTS.entrySet()) {
+        String serverName = e.getKey();
+        MCPClient server = e.getValue();
+        for (McpToolDef td : server.tools) {
+            String prefixed = "mcp__" + serverName + "__" + td.name();
+            // ... MCP inputSchema → SDK Tool.InputSchema
+            tools.add(Tool.builder().name(prefixed).description(td.description()).inputSchema(isb.build()).build());
+            String tn = td.name();
+            handlers.put(prefixed, args -> server.callTool(tn, args));
+        }
+    }
+    return new ToolPool(tools, handlers);
+}
 ```
 
 所以 `connect_mcp("docs")` 后，下一轮工具池里会出现 `mcp__docs__search`。
 
+> 和 Python 原版的差别：Python 有 26 个内置工具。Java 版没有一次性 subagent `task`、手动 `compact`、`update_task` / `get_task`、`list_crons` / `cancel_cron`、`send_message`、`request_shutdown` / `request_plan` / `review_plan` 和 `create_worktree`。
+
 ### 权限和 hooks
 
-权限不写死在工具执行行里，而是作为 `PreToolUse` hook：
+Java 版没有 s04 那样可注册回调的 hook 框架。权限是工具执行前直接调用的一个函数：
 
-```python
-blocked = trigger_hooks("PreToolUse", block)
-if blocked:
-    results.append(tool_result(block.id, blocked))
-    continue
+```java
+private static String permissionCheck(ToolUseBlock block, Map<String, Object> input) {
+    String name = block.name();
+    if ("bash".equals(name)) {
+        String cmd = (String) input.getOrDefault("command", "");
+        for (String p : DENY_LIST) if (cmd.contains(p)) {
+            return "Permission denied by deny list";
+        }
+    }
+    if (name.startsWith("mcp__")) {
+        // 简化: 所有 MCP 工具都放行 (s14 有 host policy 表)
+    }
+    return null;
+}
 ```
 
-这样 permission、log、审计都可以挂在同一个 hook 点上。Lead、一次性 subagent 和队友的工具都会先经过 `PreToolUse`；允许执行的调用会在 handler 返回后触发 `PostToolUse`。
+执行工具时，权限检查、后台分发和普通分发包在同一个 `try` 里。参数缺失或类型不对抛出的异常会变成 `tool_result`，不会让整个程序退出：
 
-权限判断不会把 MCP server 自己写的 description 当成授权依据。宿主维护一组精确的已知只读工具名单，其他 MCP 工具都要询问用户。文件工具越过 `WORKDIR` 会直接拒绝，每条 bash 命令执行前都会询问。只有前台用户轮次可以弹出交互确认；异步轮次直接拒绝需要确认的操作，不和主 CLI 争抢输入。
+```java
+String blocked = permissionCheck(tb, input);
+String output;
+try {
+    if (blocked != null) {
+        output = blocked;
+    } else if ("bash".equals(tb.name()) && Boolean.TRUE.equals(input.get("run_in_background"))) {
+        output = "Background task " + bgStart(tb, (String) input.get("command"))
+                + " started. Result arrives as <task_notification>.";
+    } else {
+        var handler = pool.handlers().get(tb.name());
+        output = handler == null ? "Unknown tool: " + tb.name() : handler.apply(input);
+    }
+} catch (Exception e) {
+    output = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+}
+```
+
+`UserPromptSubmit`、`PostToolUse` 和 `Stop` 都只是在对应位置打印日志，`PostToolUse` 额外检查输出是否超过 100,000 字符。
+
+> 和 Python 原版的差别：Python 把权限挂在 `PreToolUse` hook 上，Lead、subagent 和队友的工具都会经过它。Python 还有这几条规则：MCP 工具只有宿主名单里的只读工具直接放行，其余都要询问用户；文件工具越过 `WORKDIR` 直接拒绝；每条 bash 命令执行前都会询问；异步轮次直接拒绝需要确认的操作。Java 版只有 bash deny-list，MCP 工具全部放行，文件工具不检查路径越界，也没有任何交互确认。
 
 ### 计划与任务
 
 S15 同时保留两层计划：
 
-- `todo_write`：当前会话内的轻量计划，保存在内存中
-- task graph：跨会话、可依赖、可认领的任务文件，写入 `.tasks/task_*.json`
+- `todo_write`：当前会话内的轻量计划，保存在内存里的 `TODOS`，每次整表替换
+- task graph：写入 `.tasks/task_*.json` 的任务文件，有稳定 ID 和单条状态更新
 
-前者帮助单个 Agent 不漂移；后者支撑团队协作。
+前者帮助单个 Agent 不漂移，后者支撑跨会话和团队协作。连续 3 轮工具调用都没有 `todo_write` 时，循环会在 tool_result 后面追加一条提醒：
 
-两者目标相近，但实现不同：`todo_write` 整表替换当前会话清单，task record 则有稳定 ID 和单条生命周期更新。下面单独出现的 `task` 工具表示“一次性派发隔离 subagent”，不是 Task System。
+```java
+if (usedTodo) ROUNDS_SINCE_TODO = 0;
+else ROUNDS_SINCE_TODO++;
+if (ROUNDS_SINCE_TODO >= 3) {
+    results.add(ContentBlockParam.ofText(TextBlockParam.builder()
+            .text("<reminder>Update your todos.</reminder>").build()));
+    ROUNDS_SINCE_TODO = 0;
+}
+```
 
-集成宿主中的任务图仍采用两阶段构建：Lead 先创建所有任务节点，再使用 `create_task` 返回的运行时 ID 调用 `update_task`。队友只能列举、认领和完成任务，因此依赖结构由 Lead 在分发工作前确定。
+> 和 Python 原版的差别：Java 版的任务工具只有 `create_task`、`list_tasks`、`claim_task` 和 `complete_task`，没有 `update_task`，所以任务之间不能建立 `blockedBy` 依赖，也就没有 s10 的两阶段建图。`claim_task` 一律把 owner 记成 `agent`，队友认领时也是如此。
 
 ### 子 agent 与团队
 
-S15 有两种 delegation：
+`spawn_teammate` 启动一个 daemon 线程。传入 `task_id` 时，它先认领任务，再调用**一次**模型，然后完成任务，把结果发到 Lead 收件箱后退出：
 
-- `task`：一次性 subagent。独立 `messages[]`，中间过程丢弃，只返回最终摘要。
-- `spawn_teammate`：持久队友线程。传入 ready `task_id` 时，运行时会在线程启动前完成认领；不传时，队友可以在 IDLE 中等待后续任务。没有 assignment 的队友不能使用文件或 Shell 工具。它按 `WORK → result → IDLE` 运行，不设固定的工具轮数上限；模型或分发失败会发出 `error`，线程清理会把未完成 assignment 释放回任务板。每次调用模型前都会先读取收件箱，因此直接消息和关机请求不会被连续的 tool-use 轮次饿死。idle 时先等待 `MessageBus` 消息，只在超时后扫描就绪 task，并以原子操作最多认领一个。
+```java
+Thread t = new Thread(() -> {
+    try {
+        String initPrompt = prompt;
+        if (taskId != null) {
+            runClaimTask(taskId);
+            Task tk = loadTask(taskId);
+            initPrompt += "\n[Assigned task " + tk.id() + "] " + tk.subject() + "\n" + tk.description();
+        }
+        // 极简: 单轮 LLM 调用 + 报告结果
+        MessageCreateParams params = MessageCreateParams.builder()
+                .model(MODEL).system("You are '" + name + "', a " + role
+                        + ". Do the task briefly and report back concisely.")
+                .maxTokens(2000).temperature(0.3)
+                .addUserMessage(initPrompt).build();
+        Message resp = CLIENT.messages().create(params);
+        String text = /* resp 里的全部 text */;
+        if (taskId != null) runCompleteTask(taskId);
+        BUS.send(name, "lead", text.isEmpty() ? "(done)" : text, "result", null);
+    } catch (Exception e) {
+        BUS.send(name, "lead", e.getMessage(), "error", null);
+    } finally {
+        ACTIVE_TEAMMATES.remove(name);
+    }
+}, "teammate-" + name);
+```
 
-Lead 启动队友后结束当前轮次，不在模型循环里反复查询状态。队友事件进入 Lead 收件箱后，运行时会自动唤醒下一轮。
+`MessageBus` 和 s13 一样，每个 Agent 一个 `.mailboxes/<name>.jsonl` 收件箱，每条消息写成一行 JSON。Lead 启动队友后结束当前轮次；队友结果进入 Lead 收件箱后，主循环会自动唤醒下一轮（见「后台和 cron」一节）。
 
-一次性 subagent 解决“上下文隔离”；持久队友解决“长期并行协作”。
+> 和 Python 原版的差别：Python 有两种 delegation。一种是一次性 subagent `task`，有独立 `messages[]`，只返回最终摘要。另一种是持久队友，按 `WORK → result → IDLE` 循环运行，带文件和 Shell 工具，IDLE 时等消息或原子认领就绪任务，还支持关机和计划审批协议。Java 版没有 subagent。队友只调用一次模型、不带任何工具、做完就退出，也没有协议。
 
 ### 记忆、技能和 prompt
 
-S15 直接复用 s09 的 Memory runtime。每轮调用模型前，它读取 `.memory/MEMORY.md` 目录，根据当前请求选择相关记录，再把选中的正文交给 `assemble_system_prompt(context)`。本轮结束后，`extract_memories()` 提取可跨会话使用的信息；有新增记录时再运行 `consolidate_memories()`。
+每轮调用模型前，`assembleSystem()` 拼出 system prompt：身份说明、skills catalog、memory catalog、按当前请求召回的相关记忆，以及已连接的 MCP server。
 
-同一份 system prompt 还会加入身份、工具说明、workspace、skills catalog 和已连接的 MCP server。技能只放目录，完整内容通过 `load_skill(name)` 按需加载。
+```java
+private static String assembleSystem(String recallHint) {
+    StringBuilder sb = new StringBuilder();
+    sb.append("You are the Lead coding agent at ").append(WORKDIR).append(". Act, don't explain.\n");
+    sb.append("You have s01-s14 abilities: tools, permissions, todos, skills, memory, tasks, "
+            + "background bash, cron, teammates, MCP.\n");
+    String sc = skillCatalog();
+    if (!sc.isEmpty()) sb.append("\n").append(sc);
+    String mc = memoryCatalog();
+    if (!mc.isEmpty()) sb.append("\n").append(mc);
+    if (!recallHint.isEmpty()) sb.append("\n").append(recallHint);
+    if (!MCP_CLIENTS.isEmpty()) sb.append("\nConnected MCP servers: ").append(String.join(", ", MCP_CLIENTS.keySet()));
+    return sb.toString();
+}
+```
+
+技能只放目录，完整内容通过 `load_skill(name)` 按需加载。记忆召回由 `memoryRecall(query)` 完成：从请求里取英文单词和中文词，按命中数给 `.memory/*.md` 打分，取前 3 条，把正文放进 system prompt。cron、后台或队友事件触发的唤醒轮次没有新的用户输入，召回沿用上一条用户请求。
+
+> 和 Python 原版的差别：Python 直接复用 s09 的 Memory runtime，先让模型选择相关记录，失败后才降级为关键词匹配；本轮结束后还会 `extract_memories()` 提取新记忆，并在需要时 `consolidate_memories()`。Java 版只有关键词召回，不会自动写入或整理记忆，`.memory/` 里的内容需要事先准备好。
 
 ### 压缩和恢复
 
-LLM 前先跑压缩管线：
+LLM 调用前先跑 `maybeCompact()`。估算的字符数超过 40,000 且消息超过 10 条时，保留开头 3 条和最后 5 条，中间换成一条 `[N earlier messages elided by compaction]`。切口会做对齐，不会把 `tool_use` 和它的 `tool_result` 拆开：
 
-```text
-tool_result_budget → snip_compact → micro_compact → compact_history
+```java
+int head = 3, tailStart = history.size() - 5;
+// 切口不能把 tool_use 和它的 tool_result 拆开 (对齐 s08 snipCompact)
+if (hasToolUse(history.get(head - 1))) {
+    while (head < tailStart && isToolResultMsg(history.get(head))) head++;
+}
+if (isToolResultMsg(history.get(tailStart)) && hasToolUse(history.get(tailStart - 1))) tailStart--;
+if (head >= tailStart) return history;
+List<MessageParam> out = new ArrayList<>(history.subList(0, head));
+out.add(MessageParam.builder().role(MessageParam.Role.USER)
+        .content("[" + (tailStart - head) + " earlier messages elided by compaction]").build());
+out.addAll(history.subList(tailStart, history.size()));
 ```
 
-`snip_compact` 会先归档完整历史，再裁掉中段消息。`micro_compact` 只在上下文超限时运行：它先保存较早且已读取的结果，再用恢复路径替换；最近 3 条保持完整，并在接近阈值 80% 时停止。如果未读取的新结果本身过大，S15 会先保留预览和完整输出路径，再考虑总结历史。
+拆开的配对会让 API 拒绝整段历史。坏掉的历史会一直留在会话里，所以之后每一轮都会失败。
 
-调用模型时再包一层恢复：
-
-- 429：指数退避重试
-- 529：指数退避，连续失败可切 fallback model
-- `max_tokens`：先提高 max_tokens，再要求 continuation
-- prompt too long：reactive compact 后重试
+> 和 Python 原版的差别：Python 跑完整的 s08 四步管线（`tool_result_budget → snip_compact → micro_compact → compact_history`），会归档完整历史、保存大输出、必要时生成摘要。模型调用还会再包一层恢复：429 / 529 指数退避（529 连续失败可切 fallback model）、`max_tokens` 升级加 continuation、prompt too long 时 reactive compact。Java 版的压缩直接丢掉中间消息，不归档也不摘要。字符数估算也很粗：block 形式的消息每个 block 按 200 字符计，大的工具输出几乎不会触发压缩。模型调用出错时只打印错误并结束本轮，依赖 SDK 客户端自带的自动重试。
 
 ### 后台和 cron
 
-bash 调用设置 `run_in_background=true` 后，主循环不再等待命令结束，而是先返回占位结果：
+bash 调用设置 `run_in_background=true` 后，主循环不等命令结束，而是先返回占位结果：
 
 ```text
-should_run_background → start_background_task → placeholder tool_result
-后台完成 → task_notification → 下一轮注入 messages
+run_in_background=true → bgStart → 占位 tool_result
+后台完成 → BG_READY → 下一轮 bgCollect() 注入 <task_notification>
 ```
 
-只有显式标记的 bash 调用会进入后台路径。命令非零退出或 worker 抛出异常时会发出 `failed` 通知。每条 Shell 命令都在独立进程组中运行；命令结束，或 Agent 经正常路径、`SIGTERM` 退出时，运行时会停止原进程组。另建 session 的进程可以离开这个进程组。
+cron 调度线程每秒检查一次，表达式匹配且本分钟还没触发过，就把任务放进 `CRON_QUEUE`；下一轮开始时以 `[Scheduled] <prompt>` 注入。
 
-cron 调度器独立 daemon thread 每秒检查一次。durable 的一次性任务会先持久化为 `pending_delivery`，再进入队列，并保留到包含该 prompt 的模型调用成功；调用失败会放回队列，重启后也会再次入队，因此交付语义是至少一次。CLI 同时监听 `cron_queue`、Lead 收件箱和已经结束的后台任务，任一事件都能自动唤醒一轮 Agent。
+这些异步事件到达时不需要用户输入。主线程和 s13 一样，把阻塞读 stdin 的工作交给一个 daemon 线程，自己交替检查「有没有异步事件」和「有没有用户输入」：
+
+```java
+/** 只看不取: agentLoop 开头才真正 consume 这三类事件 */
+private static boolean hasPendingEvents() {
+    CRON_LOCK.lock();
+    try { if (!CRON_QUEUE.isEmpty()) return true; } finally { CRON_LOCK.unlock(); }
+    BG_LOCK.lock();
+    try { if (!BG_READY.isEmpty()) return true; } finally { BG_LOCK.unlock(); }
+    return BUS.peek("lead");
+}
+
+private static CliEvent waitForCliEvent() {
+    boolean promptVisible = false;
+    while (true) {
+        if (hasPendingEvents()) {
+            if (promptVisible) System.out.println();
+            return new CliEvent("wake", null);
+        }
+        if (!promptVisible) { System.out.print("\033[36ms15v >> \033[0m"); promptVisible = true; }
+        Optional<String> line;
+        try { line = CLI_INPUT.poll(250, TimeUnit.MILLISECONDS); }
+        catch (InterruptedException e) { /* ... */ return new CliEvent("quit", null); }
+        if (line == null) continue;                              // 超时: 回去看异步事件
+        if (line.isEmpty()) return new CliEvent("quit", null);   // stdin EOF
+        return new CliEvent("user", line.get());
+    }
+}
+```
+
+`main` 拿到 `wake` 时直接开一轮；事件本身由 `agentLoop` 开头的 `bgCollect()`、`consumeCronQueue()` 和 `consumeLeadInbox()` 取出并注入。
+
+> 和 Python 原版的差别：
+> - **后台 bash**：Python 的每条 Shell 命令在独立进程组中运行，退出时会清理。Java 版没有进程清理，后台输出截到 5,000 字符，通知摘要截到 300 字符。
+> - **cron**：Python 有 durable 任务和 `pending_delivery`，模型调用失败会放回队列，交付语义是至少一次。Java 版的 cron 只存在内存里，进程退出就消失；任务一取出就离开队列，调用失败也不会放回，属于至多一次。`schedule_cron` 只检查字段个数，也没有 `list_crons` / `cancel_cron`。
 
 ### worktree 与 MCP
 
-从 s13 继承的任务级 worktree 机制负责管理任务工作目录：
+Java 版没有 worktree 机制。所有工具都在 `WORKDIR` 下运行，队友本身也不带文件或 Shell 工具。
 
-- pending 且未被认领的 task 可以留在主工作区，也可以通过 `create_worktree(name, task_id)` 绑定独立分支和目录
-- 创建前会校验 task、名称、路径、分支和 Git registry；Git 命令失败后还会核对 registry 和分支状态，任何部分创建的 checkout 都保持未绑定并保留供人工恢复
-- idle 队友以原子操作认领一个就绪 task，assignment 同时记录 `task_id` 和有效 `cwd`
-- Lead 也可以把 ready `task_id` 直接传给 `spawn_teammate`，认领成功后才启动线程
-- 队友所有文件工具都使用该 `cwd`；只有 task owner 能完成任务，assignment 会保留到当前模型轮次结束
-- 移除保留在宿主侧的 `remove_worktree()` 函数中，模型不能调用。用户或宿主先检查任务所有权、assignment lease、后台工作和 Git 状态；破坏性移除需要另行取得用户确认
+MCP 沿用 s14 的思路，但更简化：
 
-worktree 只改变工具的默认工作目录，用于分离 working copy，并不是安全沙箱。进程组清理也无法约束另建 session 的进程，因此删除保留为宿主操作。
+- `connect_mcp("docs")` 连接进程内 mock server，它只有一个 `search` 工具
+- `assembleToolPool()` 把 MCP 工具组装进工具池，工具名统一为 `mcp__server__tool`
 
-认领或释放 task 会改变 assignment version，使旧的 plan approval 失效；普通 `send_message` 只传递消息，不会改变 task identity 或 plan 状态。
-
-MCP 负责外部能力：
-
-- `connect_mcp(name)` 连接 mock server
-- `assemble_tool_pool()` 把 MCP 工具组装进工具池，并拒绝规范化后的名称冲突
-- 工具名统一为 `mcp__server__tool`
+> 和 Python 原版的差别：Python 的 s15 从 s13 继承了任务绑定的 worktree：Lead 可以 `create_worktree(name, task_id)`，认领任务后队友的文件工具切到对应目录，移除留给宿主。Python 的 MCP 还有名称规范化、冲突检查和宿主授权策略。Java 版的 MCP 不做名称规范化和冲突检查，不检查参数，也没有授权策略。
 
 ---
 
 ## 相对 s14 的变化
 
-| 范围 | s14 MCP | s15 Integrated Harness |
+| 范围 | s14 MCP | s15 Integrated Harness（Java） |
 |------|---------|-------------------------|
-| 内置工具 | 6 个 | 25 个 |
-| 外部工具 | 已连接的 MCP 工具 | 沿用同一套动态 MCP 路径和宿主策略 |
-| 本地机制 | S04 工具、hooks、权限和 MCP | todo、subagent、skills、compaction、memory、task graph、后台 bash、cron、teams 和 worktrees |
-| 事件来源 | 用户输入和工具结果 | 用户输入、工具结果、cron prompt、后台通知和 team events |
+| 内置工具 | 6 个 | 15 个 |
+| 外部工具 | 已连接的 MCP 工具（docs、deploy） | 已连接的 MCP 工具（只有 docs），全部放行 |
+| 本地机制 | S04 工具、hooks、权限和 MCP | todo、skills、compaction、memory recall、task 文件、后台 bash、cron、单次调用的队友 |
+| 事件来源 | 用户输入和工具结果 | 用户输入、工具结果、cron prompt、后台通知和 team events，后三者会自动唤醒新一轮 |
 
 ---
 
@@ -220,22 +351,20 @@ mvn -q compile exec:java -Dexec.mainClass=com.learn.cc.s15_integrated_harness.Ag
 
 可以试：
 
-1. `检查这个仓库，告诉我哪些 Python 文件最重要。`
-2. `从已连接的文档中查一下 agent loop 的相关说明。`
-3. `请在独立的 worktree 中并行重构认证模块和登录页，修改前先把各自的计划给我看。`
+1. `检查这个仓库，告诉我哪些 Java 文件最重要。`
+2. `连接 docs server，查一下 agent loop 的相关说明。`
+3. `创建一个“整理 README”的任务，让队友 bob 去完成，完成后告诉我结果。`
 4. `3 分钟后提醒我开会。`
-5. `在后台安装依赖，同时继续阅读 README.md。`
+5. `在后台运行 sleep 5 && ls，同时读一下 README.md。`
 
 观察重点：
 
-- 工具调用前是否经过 hooks/permission
-- `connect_mcp` 后下一轮是否出现 MCP 工具
-- 设置 `run_in_background=true` 的 bash 调用是否返回 background placeholder
-- 到点是不是自动提醒开会
-- 队友是否提交 plan，并在 approval 前暂停
-- idle 队友是否只原子认领一个就绪 task
-- 队友所有文件工具是否都切换到已认领 task 的 `cwd`
-- 完成任务后是否在本轮剩余工具调用中保持 task `cwd`，并在 IDLE 时释放
+- bash 命令命中 deny-list 时是否被拒绝
+- `connect_mcp` 后下一轮是否出现 `mcp__docs__search`
+- 设置 `run_in_background=true` 的 bash 调用是否先返回占位结果，完成后是否不用输入就出现 `[wake: ...]`
+- 到点后是否不用输入就自动提醒开会
+- 队友 bob 的结果是否自动回到 Lead
+- 连续 3 轮没更新 todo 时是否出现 `[nag] reminder injected`
 
 ---
 

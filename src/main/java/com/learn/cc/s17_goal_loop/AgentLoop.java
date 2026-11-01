@@ -101,8 +101,12 @@ public final class AgentLoop {
     private static final String MODEL    = DOTENV.get("MODEL_ID");
     /** 设 DEBUG_HTTP=1 (环境变量或 .env) 时, 每轮打印发给模型的请求体和响应 JSON，便于对照 HTTP 线上格式。 */
     private static final boolean DEBUG_HTTP = "1".equals(DOTENV.get("DEBUG_HTTP"));
-    /** 评估器用的模型, 可以配置不同, 默认同主模型 */
-    private static final String EVAL_MODEL = System.getenv().getOrDefault("GOAL_EVALUATOR_MODEL_ID", MODEL);
+    /**
+     * 评估器用的模型, 可以配置不同, 默认同主模型。
+     * 和其他配置一样从 DOTENV 读 (Dotenv 也会读系统环境变量); 原来只读 System.getenv(), 写在 .env 里不生效
+     */
+    private static final String EVAL_MODEL = Optional.ofNullable(DOTENV.get("GOAL_EVALUATOR_MODEL_ID"))
+            .filter(s -> !s.isBlank()).orElse(MODEL);
     private static final Path WORKDIR = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
     private static final AnthropicClient CLIENT = buildClient();
     private static final Scanner USER_INPUT = new Scanner(System.in);
@@ -110,11 +114,17 @@ public final class AgentLoop {
     /** 连续 block 上限 (超过 → 强制 return status=limit) */
     private static final int DEFAULT_BLOCK_CAP = 3;
     private static final int MAX_GOAL_LENGTH = 500;
+    /** "/goal <这些词>" 表示清除当前 goal, 而不是把它当成新的完成条件 */
+    private static final java.util.Set<String> CLEAR_ALIASES =
+            java.util.Set.of("clear", "stop", "off", "reset", "none", "cancel");
 
     private static final String SYSTEM =
             "You are a coding agent at " + WORKDIR + ". "
                     + "Use tools to solve tasks. When the user sets /goal <condition>, "
-                    + "work until the condition is verifiably met.";
+                    + "work until the condition is verifiably met. "
+                    // 评估器只能读对话, 读不到文件也跑不了命令; 验证结果必须明确写进对话它才能判断
+                    + "After running a verification command, state the command and its result "
+                    + "explicitly in the conversation so the independent evaluator can check it.";
 
     // ══════════════════════════════════════════════════════════════════
     //  ★ s17 核心 1: Goal 状态 + 评估结果的数据模型
@@ -491,7 +501,14 @@ public final class AgentLoop {
                 ToolUseBlock tb = block.toolUse().get();
                 Map<String, Object> input = JSON_MAPPER.convertValue(tb._input(), new TypeReference<>() {});
                 System.out.println("\033[36m> " + tb.name() + " " + input + "\033[0m");
-                String output = dispatchTool(tb.name(), input);
+                // 工具输入错误要留在工具边界内: 参数缺失或类型不对会抛 NPE / ClassCastException,
+                // 不接住的话会一路冒出 agentLoop 把整个程序打崩; 接住后作为 tool_result 返回, 模型下一轮可以修正
+                String output;
+                try {
+                    output = dispatchTool(tb.name(), input);
+                } catch (Exception e) {
+                    output = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+                }
                 System.out.println(output.length() > 300 ? output.substring(0, 300) + "..." : output);
                 results.add(ContentBlockParam.ofToolResult(ToolResultBlockParam.builder()
                         .toolUseId(tb.id()).content(output).build()));
@@ -525,7 +542,7 @@ public final class AgentLoop {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  Entry: 支持 /goal /goal-clear /goal-status 命令
+    //  Entry: 支持 /goal, /goal <condition>, /goal clear (及 /goal-status, /goal-clear 别名)
     // ══════════════════════════════════════════════════════════════════
 
     public static void main(String[] args) {
@@ -535,9 +552,9 @@ public final class AgentLoop {
         System.out.println("Model: " + MODEL + "  Evaluator model: " + EVAL_MODEL);
         System.out.println();
         System.out.println("命令:");
-        System.out.println("  /goal <condition>   设定完成条件");
-        System.out.println("  /goal-clear         清除当前 goal");
-        System.out.println("  /goal-status        查看当前 goal 状态");
+        System.out.println("  /goal <condition>   设定 (或替换) 完成条件, 并立即开始");
+        System.out.println("  /goal               查看当前 goal 状态 (别名 /goal-status)");
+        System.out.println("  /goal clear         清除当前 goal (也可用 stop/off/reset/none/cancel, 别名 /goal-clear)");
         System.out.println("  q                    退出");
         System.out.println("其他输入 = 普通 prompt\n");
 
@@ -549,11 +566,17 @@ public final class AgentLoop {
             String q = USER_INPUT.nextLine().trim();
             if (q.isEmpty() || q.equalsIgnoreCase("q") || q.equalsIgnoreCase("exit")) break;
 
-            // 命令处理
+            // 命令处理 (对齐 Python 原版):
+            //   /goal                    查看状态
+            //   /goal clear|stop|off|reset|none|cancel   清除
+            //   /goal <condition>        设置/替换并立即开始
+            // /goal-status, /goal-clear 保留为别名。原来 /goal 会报 "条件不能为空",
+            // /goal clear 会把 "clear" 当成新的完成条件并让模型去 "Work on this goal: clear"
+            if (q.equals("/goal") || q.startsWith("/goal-status")) { System.out.println(GOAL.status()); continue; }
             if (q.startsWith("/goal-clear")) { System.out.println(GOAL.clearGoal()); continue; }
-            if (q.startsWith("/goal-status")) { System.out.println(GOAL.status()); continue; }
-            if (q.startsWith("/goal ") || q.equals("/goal")) {
-                String cond = q.startsWith("/goal ") ? q.substring(6).trim() : "";
+            if (q.startsWith("/goal ")) {
+                String cond = q.substring(6).trim();
+                if (CLEAR_ALIASES.contains(cond.toLowerCase())) { System.out.println(GOAL.clearGoal()); continue; }
                 try {
                     GOAL.setGoal(cond);
                     // ★ 关键: 设 goal 后立即把 goal 作为 user 消息发给主模型, 无需二次 prompt

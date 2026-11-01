@@ -180,14 +180,18 @@ public final class AgentLoop {
             return Math.abs(h);
         }
 
-        Object cached(String key) {
+        // cached / record 会被多个 wf-worker 线程同时调用, cache 是普通 LinkedHashMap, 所以加 synchronized
+        synchronized Object cached(String key) {
             return cache.getOrDefault(key, MISS);
         }
 
-        void record(String key, Object value) throws IOException {
+        synchronized void record(String key, Object value) throws IOException {
             Map<String, Object> rec = new LinkedHashMap<>();
             rec.put("key", key); rec.put("value", value);
-            Files.writeString(path, JSON_MAPPER.writeValueAsString(rec) + "\n",
+            // 必须写成单行: JSON_MAPPER 全局开了 INDENT_OUTPUT, 直接 writeValueAsString 会输出多行 JSON,
+            // 破坏 jsonl "一行一条记录" 的格式, resume 时逐行解析全部失败, 缓存一条都读不回来, 所有 agent 重跑
+            Files.writeString(path, JSON_MAPPER.writer().without(SerializationFeature.INDENT_OUTPUT)
+                            .writeValueAsString(rec) + "\n",
                     java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
             cache.put(key, value);
         }
@@ -309,7 +313,14 @@ public final class AgentLoop {
             System.out.println("  event      " + String.format("%-18s", name) + sb.toString().trim());
         }
 
-        void progressEvent(String type, Map<String, Object> data) {
+        /** agent 完成时由 wf-worker 线程调用; usage 是普通 LinkedHashMap, 并发 merge 会丢更新, 所以加锁 */
+        synchronized void addUsage(int tokens) {
+            usage.merge("agents", 1, Integer::sum);
+            usage.merge("tokens", tokens, Integer::sum);
+        }
+
+        // 多个 wf-worker 线程会同时发进度事件, progress 是普通 ArrayList, 所以加 synchronized
+        synchronized void progressEvent(String type, Map<String, Object> data) {
             Map<String, Object> rec = new LinkedHashMap<>();
             rec.put("type", type); rec.putAll(data);
             progress.add(rec);
@@ -401,8 +412,7 @@ public final class AgentLoop {
                 try {
                     RunnerOutput out = runner.run(prompt, schema, finalLabel);
                     budget.add(out.tokens());
-                    task.usage.merge("agents", 1, Integer::sum);
-                    task.usage.merge("tokens", out.tokens(), Integer::sum);
+                    task.addUsage(out.tokens());
                     try { journal.record(key, out.value()); } catch (IOException ignore) {}
                     task.progressEvent("workflow_agent", Map.of(
                             "label", finalLabel,
@@ -475,6 +485,9 @@ public final class AgentLoop {
             throw new IllegalArgumentException("meta.description must be a string");
     }
 
+    /** createRunId 生成的格式: run_<meta.name>_<毫秒时间戳>_<随机数>; meta.name 已限定为安全 slug */
+    private static final Pattern RUN_ID = Pattern.compile("^run_[A-Za-z0-9._-]{1,64}_\\d+_\\d+$");
+
     /** 生成 run_id / task_id */
     private static String createRunId(Map<String, Object> meta) {
         String name = String.valueOf(meta.get("name"));
@@ -493,6 +506,10 @@ public final class AgentLoop {
     private static Map<String, Object> workflowCall(Map<String, Object> meta, WorkflowScript scriptFn,
                                                     Map<String, Object> args, String resumeFromRunId) throws IOException {
         validateMeta(meta);
+        // resume_from_run_id 来自模型, 会被拼进 .runtime/ 下的文件路径; 不校验的话传 "../.." 就能在目录外写文件
+        if (resumeFromRunId != null && !RUN_ID.matcher(resumeFromRunId).matches()) {
+            throw new IllegalArgumentException("invalid resume_from_run_id: " + resumeFromRunId);
+        }
         boolean resuming = resumeFromRunId != null;
         String runId = resuming ? resumeFromRunId : createRunId(meta);
         WorkflowJournal journal = new WorkflowJournal(runId, resuming);
@@ -554,8 +571,11 @@ public final class AgentLoop {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("taskId", t.taskId); m.put("taskType", "local_workflow");
         m.put("runId", t.runId); m.put("workflowName", t.meta.get("name"));
-        m.put("status", t.status); m.put("usage", new LinkedHashMap<>(t.usage));
-        m.put("progress", new ArrayList<>(t.progress));
+        m.put("status", t.status);
+        synchronized (t) {   // 与 addUsage / progressEvent 同一把锁
+            m.put("usage", new LinkedHashMap<>(t.usage));
+            m.put("progress", new ArrayList<>(t.progress));
+        }
         return m;
     }
 
@@ -761,7 +781,14 @@ public final class AgentLoop {
                 ToolUseBlock tb = mtu.get();
                 Map<String, Object> input = JSON_MAPPER.convertValue(tb._input(), new TypeReference<>() {});
                 System.out.println("\033[36m> " + tb.name() + "\033[0m");
-                String output = dispatchTool(tb.name(), input);
+                // 工具输入错误要留在工具边界内: 比如 name 传成数字会抛 ClassCastException,
+                // 不接住的话会一路冒出 agentLoop 把整个程序打崩; 接住后作为 tool_result 返回, 模型下一轮可以修正
+                String output;
+                try {
+                    output = dispatchTool(tb.name(), input);
+                } catch (Exception e) {
+                    output = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+                }
                 System.out.println(output.length() > 500 ? output.substring(0, 500) + "..." : output);
                 results.add(ContentBlockParam.ofToolResult(ToolResultBlockParam.builder()
                         .toolUseId(tb.id()).content(output).build()));
