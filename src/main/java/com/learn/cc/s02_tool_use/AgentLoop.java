@@ -20,6 +20,7 @@ import io.github.cdimascio.dotenv.Dotenv;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -30,6 +31,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
@@ -130,11 +132,20 @@ public final class AgentLoop {
                     .directory(new File(WORKDIR.toString()))
                     .redirectErrorStream(true)
                     .start();
+            // 边跑边读输出: 如果先 waitFor 再读, 输出一旦超过管道缓冲区 (macOS 上约 64KB),
+            // 子进程就会阻塞在写管道上永远结束不了, 最后被 120s 超时误杀
+            InputStream stdout = p.getInputStream();
+            CompletableFuture<byte[]> output = CompletableFuture.supplyAsync(() -> {
+                try { return stdout.readAllBytes(); } catch (IOException e) { return new byte[0]; }
+            });
             if (!p.waitFor(120, TimeUnit.SECONDS)) {
+                // 先杀子孙进程, 再杀 shell。顺序不能反: shell 一死, 它的子进程就被 init 收养,
+                // 之后 p.descendants() 沿父子关系再也找不到它们, 子进程会在后台残留
+                p.descendants().forEach(ProcessHandle::destroyForcibly);
                 p.destroyForcibly();
                 return "Error: Timeout (120s)";
             }
-            String out = new String(p.getInputStream().readAllBytes()).trim();
+            String out = new String(output.join()).trim();
             if (out.isEmpty()) return "(no output)";
             return out.length() > 50_000 ? out.substring(0, 50_000) : out;
         } catch (IOException | InterruptedException e) {
@@ -240,7 +251,14 @@ public final class AgentLoop {
         Map<String, Object> input = JSON_MAPPER.convertValue(
                 block._input(), new TypeReference<Map<String, Object>>() {});
         System.out.println("\033[33m> " + name + " " + input + "\033[0m");
-        String output = dispatchTool(name, input);
+        // 工具输入错误要留在工具边界内: 参数缺失或类型不对会抛 NPE / ClassCastException,
+        // 不接住的话会一路冒出 agentLoop 把整个程序打崩; 接住后作为 tool_result 返回, 模型下一轮可以修正
+        String output;
+        try {
+            output = dispatchTool(name, input);
+        } catch (Exception e) {
+            output = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+        }
         System.out.println(output.length() > 200 ? output.substring(0, 200) : output);
         return ContentBlockParam.ofToolResult(ToolResultBlockParam.builder()
                 .toolUseId(block.id())

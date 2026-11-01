@@ -1,7 +1,8 @@
 # s06: Subagent — 给子任务一段独立上下文
 
-> ℹ️ 本章正文代码片段沿用 Python 原版以突出机制；对应 Java 实现见同目录 `AgentLoop.java`。
-> s06 / s07 / s13 / s15 / s17 相比原版做了教学取舍，详见各自 `AgentLoop.java` 顶部注释。
+> ℹ️ 下面的代码片段摘自同目录 `AgentLoop.java`（有删减，完整可运行版见该文件）。
+> 子 Agent 的「全新 `messages[]`」在 Java 里是一个新的 `MessageCreateParams.Builder`：只放入 prompt，
+> 后续消息都追加在这个 builder 上，和父 Agent 的 builder 互不相干。
 
 s01 → s02 → s03 → s04 → s05 → `s06` → [s07](../s07_skill_loading/) → s08 → ... → s16 → s17
 
@@ -23,57 +24,92 @@ Agent 在修一个 bug。为了追踪调用链，它读取了许多文件；每�
 
 调用 `task` 时，会同步运行一个使用全新 `messages[]` 的嵌套 Agent Loop。循环结束后，它的最终文本会成为父对话中的工具结果。
 
-这里隔离的是消息，不是进程或文件系统。父 Agent 与子 Agent 共享 `WORKDIR`，写文件和命令仍会影响同一个工作区。子 Agent 拥有五个基础工具，但没有 `task`；它的工具调用与父 Agent 使用同一组权限和生命周期 Hooks。
+这里隔离的是消息，不是进程或文件系统。父 Agent 与子 Agent 共享 `WORKDIR`，写文件和命令仍会影响同一个工作区。子 Agent 拥有五个基础工具，但没有 `task`；它的工具调用与父 Agent 经过同一组 `PRE_TOOL_USE` hook。（Java 版 s06 只注册了 `permissionHook`，而且只检查 bash：拒绝列表加破坏性命令确认，不检查文件工具的路径。）
 
 ---
 
 ## 工作原理
 
-**run_subagent** 创建新的消息列表，运行嵌套循环，并返回最终文本：
+**runSubagent** 创建新的消息 builder，运行嵌套循环，并返回最终文本：
 
-```python
-SUB_TOOLS = list(BASE_TOOLS)  # no task tool
+```java
+private static final int SUB_MAX_TURNS = 30;
 
-def run_subagent(prompt: str) -> str:
-    messages = [{"role": "user", "content": prompt}]
+private static String runSubagent(String prompt) {
+    MessageCreateParams.Builder sub = MessageCreateParams.builder()
+            .model(MODEL).system(SUB_SYSTEM).maxTokens(8000).temperature(0.3)
+            .addUserMessage(prompt);                 // 全新的对话, 只有这一条 prompt
+    BASE_TOOLS.forEach(sub::addTool);                // 只给 5 个基础工具, 没有 task
 
-    for _ in range(30):
-        response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM,
-            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        tool_calls = [
-            block for block in response.content if block.type == "tool_use"
-        ]
-        if not tool_calls:
-            return extract_text(response.content) or "(no summary)"
+    String lastText = "";
+    for (int turn = 0; turn < SUB_MAX_TURNS; turn++) {
+        Message resp = CLIENT.messages().create(sub.build());
+        sub.addMessage(resp);
+        String t = /* resp 里的全部 text */;
+        if (!t.isEmpty()) lastText = t;
 
-        results = []
-        for block in tool_calls:
-            output = execute_tool(block, SUB_HANDLERS)
-            results.append({... "content": output})
-        messages.append({"role": "user", "content": results})
+        StopReason stop = resp.stopReason().orElse(null);
+        if (stop == null || !stop.equals(StopReason.TOOL_USE)) {
+            return lastText.isEmpty() ? "(no summary)" : lastText;
+        }
 
-    return "Subagent stopped after 30 turns without a final answer."
+        List<ContentBlockParam> results = resp.content().stream()
+                .flatMap(cb -> cb.toolUse().stream())
+                .map(AgentLoop::processSubToolCall)
+                .toList();
+        sub.addMessage(MessageParam.builder()
+                .role(MessageParam.Role.USER).contentOfBlockParams(results).build());
+    }
+    return "Subagent stopped after " + SUB_MAX_TURNS + " turns.";
+}
+
+private static ContentBlockParam processSubToolCall(ToolUseBlock block) {
+    Map<String, Object> input = /* block._input() 转成 Map */;
+    String out;
+    try {
+        if ("task".equals(block.name())) {
+            out = "Unknown tool: task";              // 只允许一层委派
+        } else {
+            String blocked = triggerHooks(HookEvent.PRE_TOOL_USE, block, input);
+            out = (blocked != null) ? blocked : dispatchTool(block.name(), input);
+        }
+    } catch (Exception e) {
+        out = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+    }
+    return ContentBlockParam.ofToolResult(ToolResultBlockParam.builder()
+            .toolUseId(block.id()).content(out).build());
+}
 ```
+
+父子 Agent 共用同一个 `dispatchTool`，里面有 `case "task"`。子 Agent 的工具列表里虽然没有 `task`，但如果模型仍然发出 `task` 调用，不拦截的话就会再起一个孙 Agent，所以 `processSubToolCall` 先把它挡掉。Python 原版的子 Agent 用的是不含 `task` 的 `SUB_HANDLERS`，效果相同。
+
+和 Python 原版的一处小差别：子 Agent 结束时，Java 返回的是**最后一次出现的非空文本**；最后一轮没有文本时，会退回到更早一轮说过的话，而不是直接返回 `(no summary)`。
 
 主 Agent 调用时，跟调其他工具一样：
 
-```python
-TASK_TOOL = {
-    "name": "task",
-    "description": "Run a subagent with fresh conversation context and return its final text.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"prompt": {"type": "string"}},
-        "required": ["prompt"],
-    },
+```java
+private static final Tool TASK_TOOL = Tool.builder()
+        .name("task")
+        .description("Run a subagent with fresh conversation context and return its final text.")
+        .inputSchema(Tool.InputSchema.builder()
+                .properties(JsonValue.from(Map.of(
+                        "prompt", Map.of("type", "string", "minLength", 1))))
+                .putAdditionalProperty("required", JsonValue.from(List.of("prompt")))
+                .build())
+        .build();
+
+private static final List<Tool> PARENT_TOOLS;     // BASE_TOOLS + TASK_TOOL
+static {
+    List<Tool> pt = new ArrayList<>(BASE_TOOLS);
+    pt.add(TASK_TOOL);
+    PARENT_TOOLS = List.copyOf(pt);
 }
 
-TOOLS = [*BASE_TOOLS, TASK_TOOL]
-TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
+// dispatchTool 里:
+case "task" -> runSubagent((String) input.get("prompt"));
 ```
+
+父 Agent 的 `processToolCall` 同样用 `try/catch` 包住分发。子 Agent 调用模型失败时（比如 API 返回错误）抛出的异常会在这里变成一条错误 `tool_result`，父 Agent 继续运行，程序不会退出。
 
 实际边界如下：
 
@@ -82,10 +118,10 @@ TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
 | 对话 | 全新的 `messages[]` | 不把父对话复制给子 Agent |
 | 执行 | 同一进程和 `WORKDIR` | 两个循环都能看到文件系统修改 |
 | 返回值 | 只返回最终文本 | 子 Agent 的工具调用和结果不进入父消息列表 |
-| 委派深度 | `SUB_TOOLS` 中没有 `task` | 本章只允许一层委派 |
+| 委派深度 | 子 Agent 只拿到 `BASE_TOOLS`，`processSubToolCall` 拒绝 `task` | 本章只允许一层委派 |
 | 工具策略 | 共享 Hooks | 父子循环使用相同的权限检查 |
 
-父 Agent 与其他工具一样，通过 handler map 分发 `task`。子 Agent 使用 `SUB_SYSTEM`、`SUB_TOOLS` 和自己的局部 `messages` 列表。
+父 Agent 与其他工具一样，通过 `dispatchTool` 的 `switch` 分发 `task`。子 Agent 使用 `SUB_SYSTEM`、`BASE_TOOLS` 和自己的 `MessageCreateParams.Builder`。
 
 ---
 
@@ -99,8 +135,8 @@ mvn -q compile exec:java -Dexec.mainClass=com.learn.cc.s06_subagent.AgentLoop
 试试这些 prompt：
 
 1. `Use a subtask to find what testing framework this project uses`（子 Agent 去读文件，主 Agent 只收结论）
-2. `Delegate: read all .py files in agents/ and summarize what each one does`
-3. `Use a task to create s06_subagent/example/string_tools.py with a slugify(text: str) function, then verify it from the parent agent`
+2. `Delegate: read the AgentLoop.java files under src/main/java/com/learn/cc/s0[1-5]* and summarize what each chapter adds`
+3. `Use a task to create src/main/java/com/learn/cc/s06_subagent/example/string_tools.py with a slugify(text: str) function, then verify it from the parent agent`
 
 观察重点：是否出现 `[Subagent started]` / `[Subagent done]`？子 Agent 的工具调用是否以 `[sub] ...` 输出？父 Agent 是否只接收到 `task` 返回的最终文本？
 

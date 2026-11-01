@@ -1,7 +1,8 @@
 # s05: TodoWrite — 没有计划的 Agent，做着做着就偏了
 
-> ℹ️ 本章正文代码片段沿用 Python 原版以突出机制；对应 Java 实现见同目录 `AgentLoop.java`。
-> s06 / s07 / s13 / s15 / s17 相比原版做了教学取舍，详见各自 `AgentLoop.java` 顶部注释。
+> ℹ️ 下面的代码片段摘自同目录 `AgentLoop.java`（有删减，完整可运行版见该文件）。
+> Python 用一个 `TodoManager` 类保存清单；Java 版没有单独的类，用静态的 `List<TodoItem> TODOS`
+> 加 `updateTodos` / `renderTodos` 两个方法，每一项是 `record TodoItem(content, status)`，状态是 `enum TodoStatus`。
 
 s01 → s02 → s03 → s04 → `s05` → [s06](../s06_subagent/) → s07 → ... → s16 → s17
 
@@ -25,85 +26,133 @@ Agent 开始干活，改了 3 个文件，跑了个测试，发现 2 个失败�
 
 ![Todo Overview](images/todo-overview.svg)
 
-S05 保留 S04 的工具分发、权限检查和 Hooks，再加入 `todo_write` 与 reminder 计数器。`todo_write` 只更新计划状态，实际工作仍由原有工具完成。
+S05 保留 S04 的工具分发、权限检查和 hook 注册表，再加入 `todo_write` 与 reminder 计数器。`todo_write` 只更新计划状态，实际工作仍由原有工具完成。（Java 版 s05 只注册了 `PRE_TOOL_USE` 上的 `permissionHook`，s04 的日志、大输出提醒、UserPromptSubmit 和 Stop 示例 hook 没有带过来。）
 
-新工具仍通过 `TOOL_HANDLERS[block.name]` 分发。连续三个工具调用轮次没有使用 `todo_write` 时，Harness 会把 reminder 追加到第三轮的工具结果中。
+新工具仍通过 `dispatchTool` 的 `switch` 分发。连续三个工具调用轮次没有使用 `todo_write` 时，Harness 会把 reminder 追加到第三轮的工具结果中。
 
 ---
 
 ## 工作原理
 
-**TodoManager** 持有内存中的任务列表，负责校验更新，并把渲染结果返回给模型。`run_todo_write` 同时把这份状态打印到终端：
+**Todo 清单**保存在内存里，`updateTodos` 负责校验更新，`renderTodos` 把清单渲染成文本返回给模型。`runTodoWrite` 同时把这份状态打印到终端：
 
-```python
-class TodoManager:
-    def __init__(self):
-        self.items = []
+```java
+public enum TodoStatus { PENDING, IN_PROGRESS, COMPLETED }
+public record TodoItem(String content, TodoStatus status) {}
+private static final List<TodoItem> TODOS = new ArrayList<>();
 
-    def update(self, todos: list | str) -> str:
-        # Parse and validate before replacing the current list.
-        validated = []
-        ...
-        self.items = validated
-        return self.render()
+private static String updateTodos(List<?> raw) {
+    if (raw == null) throw new IllegalArgumentException("todos must be a list");
+    if (raw.size() > 20) throw new IllegalArgumentException("Max 20 todos allowed");
+    List<TodoItem> vs = new ArrayList<>();
+    int inProg = 0;
+    for (int i = 0; i < raw.size(); i++) {
+        if (!(raw.get(i) instanceof Map<?, ?> m))
+            throw new IllegalArgumentException("todos[" + i + "] must be an object");
+        String content = String.valueOf(m.get("content")).trim();
+        String s = String.valueOf(m.get("status")).toLowerCase();
+        if (content.isEmpty() || "null".equals(content))
+            throw new IllegalArgumentException("todos[" + i + "] requires content");
+        TodoStatus st = switch (s) {
+            case "pending"     -> TodoStatus.PENDING;
+            case "in_progress" -> TodoStatus.IN_PROGRESS;
+            case "completed"   -> TodoStatus.COMPLETED;
+            default -> throw new IllegalArgumentException("todos[" + i + "] invalid status: " + s);
+        };
+        if (st == TodoStatus.IN_PROGRESS) inProg++;
+        vs.add(new TodoItem(content, st));
+    }
+    if (inProg > 1) throw new IllegalArgumentException("Only one in_progress allowed");
+    TODOS.clear(); TODOS.addAll(vs);      // 全部校验通过才整表替换
+    return renderTodos();
+}
 
-    def render(self) -> str:
-        # [ ] pending, [>] in progress, [x] completed
-        ...
+private static String renderTodos() {
+    // [ ] pending, [>] in progress, [x] completed, 末尾附 "(done/total completed)"
+    // ...
+}
 
-TODO = TodoManager()
-
-def run_todo_write(todos: list | str) -> str:
-    output = TODO.update(todos)
-    print(output)
-    return output
+private static String runTodoWrite(Object arg) {
+    try {
+        // 模型偶尔会把数组序列化成 JSON 字符串传进来; 先按 JSON 数组解析
+        if (arg instanceof String str) {
+            try { arg = JSON_MAPPER.readValue(str, new TypeReference<List<Object>>() {}); }
+            catch (Exception e) { return "Error: todos must be a list (string input must be a JSON array)"; }
+        }
+        if (!(arg instanceof List<?> l)) return "Error: todos must be a list";
+        String out = updateTodos(l);
+        System.out.println("\n## Current Tasks\n" + out);
+        return out;
+    } catch (IllegalArgumentException e) {
+        return "Error: " + e.getMessage();
+    }
+}
 ```
 
-一次更新最多包含 20 项；每项都必须有非空的 `content`；同一时间只能有一个 `in_progress`。字符串输入可以是 JSON，也可以是 Python 列表表示，解析过程不使用 `eval`。
+一次更新最多包含 20 项；每项都必须有非空的 `content`；同一时间只能有一个 `in_progress`。任何一项不合法，整次更新都会被拒绝，原来的清单保持不变。字符串输入必须是 JSON 数组；Python 原版还接受 Python 列表写法（如 `[{'content': ...}]`），Java 版不支持。
 
-工具定义和其他 5 个工具一起加入 dispatch map：
+工具定义和其他 5 个工具一起加入 `TOOLS`，分发处多一个 `case`：
 
-```python
-TOOLS = [
-    {"name": "bash",       ...},
-    {"name": "read_file",  ...},
-    {"name": "write_file", ...},
-    {"name": "edit_file",  ...},
-    {"name": "glob",       ...},
-    # s05: 新增一条
-    {"name": "todo_write", "description": "Create and manage a task list ...",
-     "input_schema": {
-         "type": "object",
-         "properties": {
-             "todos": {
-                 "type": "array",
-                 "items": {
-                     "type": "object",
-                     "properties": {
-                         "content": {"type": "string"},
-                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                     },
-                 },
-             },
-         },
-     },
-    },
-]
+```java
+private static final List<Tool> TOOLS = List.of(
+        tool("bash", ...),
+        tool("read_file", ...),
+        tool("write_file", ...),
+        tool("edit_file", ...),
+        tool("glob", ...),
+        // s05: 新增一条
+        Tool.builder()
+                .name("todo_write")
+                .description("Create and manage a task list for your current coding session.")
+                .inputSchema(Tool.InputSchema.builder()
+                        .properties(JsonValue.from(Map.of(
+                                "todos", Map.of(
+                                        "type", "array",
+                                        "maxItems", 20,
+                                        "items", Map.of(
+                                                "type", "object",
+                                                "properties", Map.of(
+                                                        "content", Map.of("type", "string", "minLength", 1),
+                                                        "status", Map.of("type", "string",
+                                                                "enum", List.of("pending", "in_progress", "completed"))
+                                                ),
+                                                "required", List.of("content", "status")
+                                        )
+                                )
+                        )))
+                        .putAdditionalProperty("required", JsonValue.from(List.of("todos")))
+                        .build())
+                .build()
+);
 
-TOOL_HANDLERS["todo_write"] = run_todo_write
+// dispatchTool 里:
+case "todo_write" -> runTodoWrite(input.get("todos"));
 ```
 
 **Reminder**：连续三个工具调用轮次没有使用 `todo_write` 时，reminder 会追加到第三轮的结果中，随后计数器清零：
 
-```python
-rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-if rounds_since_todo >= 3:
-    results.append({
-        "type": "text",
-        "text": "<reminder>Update your todos.</reminder>",
-    })
-    rounds_since_todo = 0
+```java
+private static final int REMINDER_ROUNDS = 3;
+
+// agentLoop 里, 每轮执行完工具后:
+boolean[] usedTodoRef = {false};
+List<ContentBlockParam> results = new ArrayList<>(response.content().stream()
+        .flatMap(cb -> cb.toolUse().stream())
+        .map(b -> {
+            if ("todo_write".equals(b.name())) usedTodoRef[0] = true;
+            return processToolCall(b);
+        })
+        .toList());
+
+roundsSinceTodo = usedTodoRef[0] ? 0 : roundsSinceTodo + 1;
+if (roundsSinceTodo >= REMINDER_ROUNDS) {
+    results.add(ContentBlockParam.ofText(TextBlockParam.builder()
+            .text("<reminder>Update your todos.</reminder>").build()));
+    roundsSinceTodo = 0;
+}
 ```
+
+lambda 里不能修改外层的局部变量，所以用一个长度为 1 的 `boolean[]` 记录「这一轮有没有调用 `todo_write`」。reminder 是一个 text block，和这一轮的 `tool_result` 放在同一条 user 消息里。`roundsSinceTodo` 是 `agentLoop` 的局部变量，用户每发一条新消息都会从 0 重新计数。
 
 Agent 收到任务后的典型流程：先调 `todo_write` 列出所有步骤（全 `pending`）→ 做一个步骤，改成 `in_progress` → 做完改成 `completed` → 看下一个 `pending` → 继续。
 
@@ -118,7 +167,7 @@ Agent 收到任务后的典型流程：先调 `todo_write` 列出所有步骤（
 | 工具数量 | 5 (bash, read, write, edit, glob) | 6 (+todo_write) |
 | 规划能力 | 无 | 带状态的 TODO 列表 + reminder |
 | SYSTEM 提示 | 通用提示 | 加入 "先计划再执行" 引导 |
-| 循环 | 工具分发与 Hooks | 保留分发路径，加入 rounds_since_todo 和 reminder 注入 |
+| 循环 | 工具分发与 Hooks | 保留分发路径，加入 `roundsSinceTodo` 和 reminder 注入 |
 
 ---
 
@@ -131,9 +180,11 @@ mvn -q compile exec:java -Dexec.mainClass=com.learn.cc.s05_todo_write.AgentLoop
 
 试试这些 prompt：
 
-1. `Refactor s05_todo_write/example/hello.py: add type hints, docstrings, and a main guard`（先列 3 步再执行）
-2. `Create a Python package under s05_todo_write/example/demo_pkg with __init__.py, utils.py, and tests/test_utils.py`
-3. `Review Python files under s05_todo_write/example and fix any style issues`
+1. `Refactor src/main/java/com/learn/cc/s05_todo_write/example/hello.py: add type hints, docstrings, and a main guard`（先列 3 步再执行）
+2. `Create a Python package under src/main/java/com/learn/cc/s05_todo_write/example/demo_pkg with __init__.py, utils.py, and tests/test_utils.py`
+3. `Review Python files under src/main/java/com/learn/cc/s05_todo_write/example and fix any style issues`
+
+（从仓库根目录运行时，工作目录就是仓库根目录，所以示例文件要写完整路径。）
 
 观察重点：第一次工具调用是不是 `todo_write`？TODO 列了几步？执行过程中状态有没有从 `pending` 变成 `in_progress` / `completed`？
 

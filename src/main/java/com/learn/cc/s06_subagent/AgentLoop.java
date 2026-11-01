@@ -21,6 +21,7 @@ import io.github.cdimascio.dotenv.Dotenv;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -30,6 +31,7 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.regex.Pattern;
@@ -128,8 +130,20 @@ public final class AgentLoop {
         try {
             Process p = new ProcessBuilder("bash", "-c", command)
                     .directory(new File(WORKDIR.toString())).redirectErrorStream(true).start();
-            if (!p.waitFor(120, TimeUnit.SECONDS)) { p.destroyForcibly(); return "Error: Timeout"; }
-            String out = new String(p.getInputStream().readAllBytes()).trim();
+            // 边跑边读输出: 如果先 waitFor 再读, 输出一旦超过管道缓冲区 (macOS 上约 64KB),
+            // 子进程就会阻塞在写管道上永远结束不了, 最后被 120s 超时误杀
+            InputStream stdout = p.getInputStream();
+            CompletableFuture<byte[]> output = CompletableFuture.supplyAsync(() -> {
+                try { return stdout.readAllBytes(); } catch (IOException e) { return new byte[0]; }
+            });
+            if (!p.waitFor(120, TimeUnit.SECONDS)) {
+                // 先杀子孙进程, 再杀 shell。顺序不能反: shell 一死, 它的子进程就被 init 收养,
+                // 之后 p.descendants() 沿父子关系再也找不到它们, 子进程会在后台残留
+                p.descendants().forEach(ProcessHandle::destroyForcibly);
+                p.destroyForcibly();
+                return "Error: Timeout (120s)";
+            }
+            String out = new String(output.join()).trim();
             if (out.isEmpty()) return "(no output)";
             return out.length() > 50_000 ? out.substring(0, 50_000) : out;
         } catch (IOException | InterruptedException e) {
@@ -239,8 +253,20 @@ public final class AgentLoop {
     private static ContentBlockParam processSubToolCall(ToolUseBlock block) {
         Map<String, Object> input = JSON_MAPPER.convertValue(
                 block._input(), new TypeReference<Map<String, Object>>() {});
-        String blocked = triggerHooks(HookEvent.PRE_TOOL_USE, block, input);
-        String out = (blocked != null) ? blocked : dispatchTool(block.name(), input);
+        String out;
+        try {
+            if ("task".equals(block.name())) {
+                // 只允许一层委派: 子 agent 的工具列表里本来就没有 task, 但父子共用 dispatchTool,
+                // 模型若仍发出 task 调用, 不拦的话会再起一个孙 agent (Python 版子 agent 用不含 task 的 SUB_HANDLERS)
+                out = "Unknown tool: task";
+            } else {
+                String blocked = triggerHooks(HookEvent.PRE_TOOL_USE, block, input);
+                out = (blocked != null) ? blocked : dispatchTool(block.name(), input);
+            }
+        } catch (Exception e) {
+            // 参数缺失或类型不对时的强制转换异常, 留在工具边界内作为 tool_result 返回
+            out = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+        }
         System.out.println("  \033[90m[sub] " + block.name() + ": "
                 + (out.length() > 100 ? out.substring(0, 100) : out) + "\033[0m");
         return ContentBlockParam.ofToolResult(ToolResultBlockParam.builder()
@@ -309,8 +335,15 @@ public final class AgentLoop {
         Map<String, Object> input = JSON_MAPPER.convertValue(
                 block._input(), new TypeReference<Map<String, Object>>() {});
         System.out.println("\033[36m> " + block.name() + "\033[0m");
-        String blocked = triggerHooks(HookEvent.PRE_TOOL_USE, block, input);
-        String out = (blocked != null) ? blocked : dispatchTool(block.name(), input);
+        // 工具输入错误要留在工具边界内: 参数缺失或类型不对时的强制转换异常, 以及 task 里子 agent
+        // 调用模型失败抛出的异常, 不接住的话都会一路冒出 agentLoop 把整个程序打崩
+        String out;
+        try {
+            String blocked = triggerHooks(HookEvent.PRE_TOOL_USE, block, input);
+            out = (blocked != null) ? blocked : dispatchTool(block.name(), input);
+        } catch (Exception e) {
+            out = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+        }
         System.out.println(out.length() > 200 ? out.substring(0, 200) : out);
         return ContentBlockParam.ofToolResult(ToolResultBlockParam.builder()
                 .toolUseId(block.id()).content(out).build());

@@ -1,7 +1,8 @@
 # s03: Permission — 执行前做权限判断
 
-> ℹ️ 本章正文代码片段沿用 Python 原版以突出机制；对应 Java 实现见同目录 `AgentLoop.java`。
-> s06 / s07 / s13 / s15 / s17 相比原版做了教学取舍，详见各自 `AgentLoop.java` 顶部注释。
+> ℹ️ 下面的代码片段摘自同目录 `AgentLoop.java`（有删减，完整可运行版见该文件）。
+> Java 版把闸门 1、2、3 合在一个 `checkPermission` 方法里，规则用 `record Rule(tools, check, message)` 表示，
+> `check` 是一个 `Predicate<Map<String, Object>>`，对应 Python 规则字典里的 lambda。
 
 s01 → s02 → `s03` → [s04](../s04_hooks/) → s05 → ... → s16 → s17
 > *"工具执行前先做权限判断"* — 权限管线决定哪些操作需要审批。
@@ -12,7 +13,7 @@ s01 → s02 → `s03` → [s04](../s04_hooks/) → s05 → ... → s16 → s17
 
 ## 问题
 
-s02 的 Agent 有 5 个工具。file tools 受 `safe_path` 保护，但 bash 不受限制。让它"清理一下项目"，可能执行 `rm -rf /`。
+s02 的 Agent 有 5 个工具。file tools 受 `safePath` 保护，但 bash 只拦截几个固定写法。让它"清理一下项目"，可能执行 `rm -rf /`。
 
 安全边界由代码负责，判断发生在工具执行之前。
 
@@ -22,7 +23,7 @@ s02 的 Agent 有 5 个工具。file tools 受 `safe_path` 保护，但 bash 不
 
 ![Permission Overview](images/permission-overview.svg)
 
-s02 的循环完全保留。唯一的变动是在工具执行前插入 `check_permission()`。每个工具调用依次经过三道闸门：硬拒绝优先，软询问次之，都没命中就放行。
+s02 的循环完全保留。唯一的变动是在工具执行前插入 `checkPermission()`。每个工具调用依次经过三道闸门：硬拒绝优先，软询问次之，都没命中就放行。
 
 三道闸门对应三种决策：
 
@@ -42,91 +43,102 @@ s02 的循环完全保留。唯一的变动是在工具执行前插入 `check_pe
 
 **闸门 1**：一张硬拒绝表，先查，命中就返回阻止信息。这张表使用简单字符串匹配来说明权限闸门的位置，不能视为完整的安全边界。
 
-```python
-DENY_LIST = [
-    "rm -rf /", "sudo", "shutdown", "reboot",
-    "mkfs", "dd if=", "> /dev/sda",
-]
+```java
+private static final List<String> DENY_LIST = List.of(
+        "rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"
+);
 
-def check_deny_list(command: str) -> str | None:
-    for pattern in DENY_LIST:
-        if pattern in command:
-            return f"Blocked: '{pattern}' is on the deny list"
-    return None
+// checkPermission 开头:
+if ("bash".equals(block.name())) {
+    String cmd = (String) input.getOrDefault("command", "");
+    for (String p : DENY_LIST) {
+        if (cmd.contains(p)) {
+            System.out.println("\n⛔ Blocked: '" + p + "' is on the deny list");
+            return false;
+        }
+    }
+}
 ```
 
 **闸门 2**负责规则匹配，用来描述"什么时候需要问用户"。每条规则指定工具和检查条件。
 
-```python
-import re
+```java
+private static final Pattern DESTRUCTIVE_COMMAND_WORD =
+        Pattern.compile("(?i)(?:^|[;&|()\\n])\\s*(?:rm|del)(?=\\s|$|[;&|()])");
 
-DESTRUCTIVE_COMMAND_WORD = re.compile(
-    r"(?i)(?:^|[;&|()\n])\s*(?:rm|del)(?=\s|$|[;&|()])"
-)
+private static boolean containsDestructiveCommand(String command) {
+    return DESTRUCTIVE_COMMAND_WORD.matcher(command).find();
+}
 
-def contains_destructive_command(command: str) -> bool:
-    return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
+private record Rule(List<String> tools, Predicate<Map<String, Object>> check, String message) {}
 
-PERMISSION_RULES = [
-    {
-        "tools": ["read_file", "write_file", "edit_file"],
-        "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
-        "message": "Access outside workspace",
-    },
-    {
-        "tools": ["bash"],
-        "check": lambda args: contains_destructive_command(args.get("command", "")) or any(
-            kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]
-        ),
-        "message": "Potentially destructive command",
-    },
-]
-
-def check_rules(tool_name: str, args: dict) -> str | None:
-    for rule in PERMISSION_RULES:
-        if tool_name in rule["tools"] and rule["check"](args):
-            return rule["message"]
-    return None
+private static final List<Rule> PERMISSION_RULES = List.of(
+        new Rule(List.of("read_file", "write_file", "edit_file"),
+                args -> {
+                    String p = (String) args.getOrDefault("path", "");
+                    return !WORKDIR.resolve(p).toAbsolutePath().normalize().startsWith(WORKDIR);
+                },
+                "Access outside workspace"),
+        new Rule(List.of("bash"),
+                args -> {
+                    String cmd = (String) args.getOrDefault("command", "");
+                    return containsDestructiveCommand(cmd)
+                            || cmd.contains("rm ") || cmd.contains("> /etc/") || cmd.contains("chmod 777");
+                },
+                "Potentially destructive command")
+);
 ```
 
-**闸门 3**：规则命中后，暂停等用户输入。
+`DESTRUCTIVE_COMMAND_WORD` 识别作为「命令词」出现的 `rm` / `del`：在开头，或者跟在 `;`、`&`、`|`、括号、换行之后，后面是空白、结尾或分隔符，不区分大小写。只靠 `contains("rm ")` 会漏掉 Windows 的 `del` / `DEL`，以及 `ls; rm` 这种 `rm` 后面没有空格的写法。
 
-```python
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
-    print(f"\n⚠  {reason}")
-    print(f"   Tool: {tool_name}({args})")
-    choice = input("   Allow? [y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
+和 Python 原版的一处差别：Java 版 s03 的文件工具不再自带 `safePath`（代码注释写着「全部交给 Gate 处理」）。所以用户在闸门 3 同意之后，工作区外的路径真的可以读写，不会再被工具自己拦下。
+
+**闸门 2 + 3**：按顺序找第一条命中的规则，命中就暂停等用户输入，只有输入 `y` / `yes` 才放行：
+
+```java
+private static boolean checkPermission(ToolUseBlock block, Map<String, Object> input) {
+    // 闸门 1: 硬拒绝 (见上)
+    // ...
+
+    // 闸门 2 + 3: 规则匹配 → 用户审批
+    for (Rule r : PERMISSION_RULES) {
+        if (r.tools().contains(block.name()) && r.check().test(input)) {
+            System.out.println("\n⚠  " + r.message());
+            System.out.println("   Tool: " + block.name() + "(" + input + ")");
+            System.out.print("   Allow? [y/N] ");
+            String choice = USER_INPUT.hasNextLine() ? USER_INPUT.nextLine().trim().toLowerCase() : "";
+            if (!(choice.equals("y") || choice.equals("yes"))) return false;
+            break;
+        }
+    }
+    return true;
+}
 ```
 
-**三道闸门串在一起**，插在工具执行之前：
+**三道闸门插在工具执行之前**。s02 的 `executeToolCall` 换成了 `processToolCall`，只多了一个判断：
 
-```python
-def check_permission(block) -> bool:
-    # 闸门 1: 硬拒绝
-    if block.name == "bash":
-        reason = check_deny_list(block.input.get("command", ""))
-        if reason:
-            print(f"\n⛔ {reason}")
-            return False
-
-    # 闸门 2 + 3: 规则匹配 → 用户审批
-    reason = check_rules(block.name, block.input)
-    if reason:
-        decision = ask_user(block.name, block.input, reason)
-        if decision == "deny":
-            return False
-
-    return True
-
-# 在 agent_loop 中——s02 的循环只加了一行：
-for block in tool_calls:
-    if not check_permission(block):           # ← 新增
-        results.append({... "content": "Permission denied."})
-        continue
-    output = TOOL_HANDLERS[block.name](**block.input)  # s02 原有
-    results.append(...)
+```java
+private static ContentBlockParam processToolCall(ToolUseBlock block) {
+    Map<String, Object> input = JSON_MAPPER.convertValue(
+            block._input(), new TypeReference<Map<String, Object>>() {});
+    String content;
+    try {
+        if (!checkPermission(block, input)) {        // ← 新增
+            content = "Permission denied.";
+        } else {
+            content = dispatchTool(block.name(), input);   // s02 原有
+        }
+    } catch (Exception e) {
+        content = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
+    }
+    return ContentBlockParam.ofToolResult(ToolResultBlockParam.builder()
+            .toolUseId(block.id())
+            .content(content)
+            .build());
+}
 ```
+
+被拒绝的调用也会得到一个 `tool_result`（内容是 `Permission denied.`），每个 `tool_use` 仍然对应一个结果。参数缺失或类型不对时，权限检查和分发里的强制转换会抛异常，`catch` 把它变成错误结果返回，程序不会退出。
 
 ---
 
@@ -135,8 +147,8 @@ for block in tool_calls:
 | 组件 | 之前 (s02) | 之后 (s03) |
 |------|-----------|-----------|
 | 安全模型 | 无（信任模型） | 三道闸门权限管线 |
-| 新函数 | — | check_deny_list, check_rules, ask_user, check_permission |
-| 循环 | 直接执行所有工具 | 执行前插入 check_permission() |
+| 新函数 | — | `checkPermission`、`containsDestructiveCommand`，以及 `DENY_LIST` / `PERMISSION_RULES` |
+| 循环 | 直接执行所有工具 | 执行前插入 `checkPermission()` |
 
 ---
 
@@ -161,7 +173,7 @@ mvn -q compile exec:java -Dexec.mainClass=com.learn.cc.s03_permission.AgentLoop
 
 ## 接下来
 
-当前权限检查每次都在循环里硬编码 `check_permission()`。如果我想在每次工具执行前后加日志？如果想在某些操作后自动触发 git commit？这些扩展逻辑散落在 loop 里，循环很快就会膨胀。
+当前权限检查每次都在循环里硬编码 `checkPermission()`。如果我想在每次工具执行前后加日志？如果想在某些操作后自动触发 git commit？这些扩展逻辑散落在 loop 里，循环很快就会膨胀。
 
 s04 Hooks → 给循环加钩子，扩展逻辑挂在钩子上，循环保持干净。
 

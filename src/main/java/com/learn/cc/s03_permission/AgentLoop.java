@@ -21,6 +21,7 @@ import io.github.cdimascio.dotenv.Dotenv;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -29,8 +30,10 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
@@ -110,11 +113,20 @@ public final class AgentLoop {
             Process p = new ProcessBuilder("bash", "-c", command)
                     .directory(new File(WORKDIR.toString()))
                     .redirectErrorStream(true).start();
+            // 边跑边读输出: 如果先 waitFor 再读, 输出一旦超过管道缓冲区 (macOS 上约 64KB),
+            // 子进程就会阻塞在写管道上永远结束不了, 最后被 120s 超时误杀
+            InputStream stdout = p.getInputStream();
+            CompletableFuture<byte[]> output = CompletableFuture.supplyAsync(() -> {
+                try { return stdout.readAllBytes(); } catch (IOException e) { return new byte[0]; }
+            });
             if (!p.waitFor(120, TimeUnit.SECONDS)) {
+                // 先杀子孙进程, 再杀 shell。顺序不能反: shell 一死, 它的子进程就被 init 收养,
+                // 之后 p.descendants() 沿父子关系再也找不到它们, 子进程会在后台残留
+                p.descendants().forEach(ProcessHandle::destroyForcibly);
                 p.destroyForcibly();
                 return "Error: Timeout (120s)";
             }
-            String out = new String(p.getInputStream().readAllBytes()).trim();
+            String out = new String(output.join()).trim();
             if (out.isEmpty()) return "(no output)";
             return out.length() > 50_000 ? out.substring(0, 50_000) : out;
         } catch (IOException | InterruptedException e) {
@@ -191,6 +203,18 @@ public final class AgentLoop {
             "rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"
     );
 
+    /**
+     * rm / del 作为"命令词"出现: 在开头, 或跟在 ; & | ( ) 换行之后, 后面是空白/结尾/分隔符。不区分大小写。
+     * 只靠 cmd.contains("rm ") 会漏掉 Windows 的 del / DEL, 以及 "ls; rm" 这种 rm 后面没有空格的写法;
+     * 同时不会误伤 model、delimiter、echo del test.txt 这类只是包含这几个字母的命令。
+     */
+    private static final Pattern DESTRUCTIVE_COMMAND_WORD =
+            Pattern.compile("(?i)(?:^|[;&|()\\n])\\s*(?:rm|del)(?=\\s|$|[;&|()])");
+
+    private static boolean containsDestructiveCommand(String command) {
+        return DESTRUCTIVE_COMMAND_WORD.matcher(command).find();
+    }
+
     private record Rule(List<String> tools, Predicate<Map<String, Object>> check, String message) {}
 
     private static final List<Rule> PERMISSION_RULES = List.of(
@@ -199,11 +223,12 @@ public final class AgentLoop {
                         String p = (String) args.getOrDefault("path", "");
                         return !WORKDIR.resolve(p).toAbsolutePath().normalize().startsWith(WORKDIR);
                     },
-                    "Writing outside workspace"),
+                    "Access outside workspace"),   // read_file 也在这条规则里, 不只是写
             new Rule(List.of("bash"),
                     args -> {
                         String cmd = (String) args.getOrDefault("command", "");
-                        return cmd.contains("rm ") || cmd.contains("> /etc/") || cmd.contains("chmod 777");
+                        return containsDestructiveCommand(cmd)
+                                || cmd.contains("rm ") || cmd.contains("> /etc/") || cmd.contains("chmod 777");
                     },
                     "Potentially destructive command")
     );
@@ -265,12 +290,18 @@ public final class AgentLoop {
                 block._input(), new TypeReference<Map<String, Object>>() {});
         System.out.println("\033[36m> " + block.name() + "\033[0m");
 
+        // 工具输入错误要留在工具边界内: 参数缺失或类型不对时, checkPermission / dispatchTool 里的强制转换
+        // 会抛 NPE / ClassCastException, 不接住的话会一路冒出 agentLoop 把整个程序打崩
         String content;
-        if (!checkPermission(block, input)) {
-            content = "Permission denied.";
-        } else {
-            content = dispatchTool(block.name(), input);
-            System.out.println(content.length() > 200 ? content.substring(0, 200) : content);
+        try {
+            if (!checkPermission(block, input)) {
+                content = "Permission denied.";
+            } else {
+                content = dispatchTool(block.name(), input);
+                System.out.println(content.length() > 200 ? content.substring(0, 200) : content);
+            }
+        } catch (Exception e) {
+            content = "Error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
         }
         return ContentBlockParam.ofToolResult(ToolResultBlockParam.builder()
                 .toolUseId(block.id())
