@@ -38,7 +38,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Scanner;
 import java.util.Set;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -91,7 +93,7 @@ import java.util.regex.Pattern;
  *      不再是简单的"输入 → agent loop → 输出", 而是同时等 stdin 和 lead mailbox
  *      teammate 发消息给 lead → Lead 醒来, 把 team 事件塞进 messages 触发新一轮
  *
- * 保留 s04 hook 系统 + JSON 打印。
+ * 不含 s04 的 hook / 权限检查 (bash 没有 deny-list); 保留 JSON 打印。
  */
 public final class AgentLoop {
 
@@ -117,7 +119,11 @@ public final class AgentLoop {
                     + "request_plan, review_plan, create_worktree.\n\n"
                     + "Create task nodes first with create_task, then use update_task to add "
                     + "dependencies. Only Lead changes task dependencies.\n\n"
-                    + "When parallel work would help, spawn teammates for independent tasks. "
+                    // 启动队友会改变成本、并发度和能改工作区的角色, 所以先提方案、等用户确认 (对齐 Python 原版)
+                    + "When parallel work would help, first propose a small team with clear "
+                    + "responsibilities and wait for the user's confirmation. Do not call "
+                    + "spawn_teammate before the user confirms. After confirmation, spawn "
+                    + "teammates for independent tasks. "
                     + "Pass task_id to spawn_teammate when assigning ready work. When separate "
                     + "working directories would prevent conflicting edits, call create_worktree "
                     + "for the pending task before assigning it; the owner's file tools then default "
@@ -615,7 +621,10 @@ public final class AgentLoop {
                 msg.put("type", type);
                 msg.put("ts", System.currentTimeMillis() / 1000.0);
                 msg.put("metadata", metadata == null ? Map.of() : metadata);
-                String line = JSON_MAPPER.writeValueAsString(msg) + "\n";
+                // 必须写成单行: JSON_MAPPER 全局开了 INDENT_OUTPUT, 直接 writeValueAsString 会输出多行 JSON,
+                // 破坏 jsonl "一行一条消息" 的格式, readInbox 逐行解析会全部失败, 消息被静默丢弃
+                String line = JSON_MAPPER.writer().without(SerializationFeature.INDENT_OUTPUT)
+                        .writeValueAsString(msg) + "\n";
                 Files.writeString(mailboxPath(to), line,
                         java.nio.file.StandardOpenOption.CREATE,
                         java.nio.file.StandardOpenOption.APPEND);
@@ -1463,10 +1472,64 @@ public final class AgentLoop {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    //  Entry point: event-driven 主循环
-    //  简化: 用一个后台线程轮询 lead mailbox, 有消息就 signal 主线程
-    //  (Python 用 select.select 同时监听 stdin+mailbox, Java 里做类似的)
+    //  Entry point: event-driven 主循环, 同时等 "用户输入" 和 "lead 收件箱"
+    //
+    //  Python 用 select.select([sys.stdin], ..., 0.25) 带超时地等 stdin, 超时就回去 peek 收件箱。
+    //  Java 的 Scanner.nextLine() 只能阻塞读, 没法带超时, 所以拆成两半:
+    //    - stdin-reader 守护线程: 专门阻塞读 stdin, 每读到一行就放进 CLI_INPUT 队列
+    //    - 主线程: 先 peek lead 收件箱, 再用 poll(250ms) 等队列; 超时就回去 peek
+    //  这样队友事件到达时, 即使用户什么都没输入, Lead 也会被自动唤醒开新一轮。
     // ══════════════════════════════════════════════════════════════════
+
+    /** 主循环等到的事件: wake = lead 收件箱有消息; user = 用户输入了一行; quit = stdin 结束 */
+    private record CliEvent(String kind, String line) {}
+
+    /** stdin-reader 线程 → 主线程。Optional.empty() 表示 stdin 已到 EOF */
+    private static final BlockingQueue<Optional<String>> CLI_INPUT = new LinkedBlockingQueue<>();
+
+    private static void startStdinReader() {
+        Thread reader = new Thread(() -> {
+            while (USER_INPUT.hasNextLine()) CLI_INPUT.add(Optional.of(USER_INPUT.nextLine()));
+            CLI_INPUT.add(Optional.empty());
+        }, "stdin-reader");
+        reader.setDaemon(true);
+        reader.start();
+    }
+
+    /** 对应 Python wait_for_cli_event: 收件箱优先, 其次每 250ms 看一次有没有用户输入 */
+    private static CliEvent waitForCliEvent() {
+        boolean promptVisible = false;
+        while (true) {
+            if (BUS.peek("lead")) {
+                if (promptVisible) System.out.println();
+                return new CliEvent("wake", null);
+            }
+            if (!promptVisible) {
+                System.out.print("\033[36ms13v >> \033[0m");
+                System.out.flush();
+                promptVisible = true;
+            }
+            Optional<String> line;
+            try { line = CLI_INPUT.poll(250, TimeUnit.MILLISECONDS); }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return new CliEvent("quit", null);
+            }
+            if (line == null) continue;                          // 超时: 回去 peek 收件箱
+            if (line.isEmpty()) return new CliEvent("quit", null);   // stdin EOF
+            return new CliEvent("user", line.get());
+        }
+    }
+
+    private static void runLeadTurn(List<MessageParam> history) {
+        Message r = agentLoop(history);
+        if (r != null) {
+            for (ContentBlock cb : r.content()) {
+                cb.text().ifPresent(t -> System.out.println(t.text()));
+            }
+        }
+        System.out.println();
+    }
 
     public static void main(String[] args) {
         if (MODEL == null || MODEL.isBlank()) {
@@ -1475,50 +1538,37 @@ public final class AgentLoop {
         System.out.println("s13: Agent Teams - Lead + 持久 teammates + shared tasks + mailbox");
         System.out.println("Tasks: " + TASKS_DIR);
         System.out.println("Mailboxes: " + MAILBOX_DIR);
-        System.out.println("输入问题, 回车发送。输入 q 退出。");
-        System.out.println("(注意: 教学版没实现 select.select 那种同时监听 stdin+mailbox, 简化为轮询)\n");
+        System.out.println("输入问题, 回车发送。输入 q 退出。\n");
 
         List<MessageParam> history = new ArrayList<>();
+        startStdinReader();
 
         while (true) {
-            System.out.print("\033[36ms13v >> \033[0m");
-            // 1. 输入之前, 先看看有没有 lead mailbox 消息 (可能 teammate 发过来了)
-            if (BUS.peek("lead")) {
+            CliEvent event = waitForCliEvent();
+            if ("quit".equals(event.kind())) break;
+
+            if ("wake".equals(event.kind())) {
+                // 队友事件到达: 不等用户输入, 直接把 [Team events] 注入 history 开一轮
                 List<Map<String, Object>> inbox = consumeLeadInbox();
-                if (!inbox.isEmpty()) {
-                    history.add(MessageParam.builder().role(MessageParam.Role.USER)
-                            .content(formatTeamEvents(inbox)).build());
-                    System.out.println("\n[wake: " + inbox.size() + " team event(s) -> new turn]");
-                    Message r = agentLoop(history);
-                    if (r != null) {
-                        for (ContentBlock cb : r.content()) {
-                            cb.text().ifPresent(t -> System.out.println(t.text()));
-                        }
-                    }
-                    System.out.println();
-                    continue;   // 处理完 team event 回到 prompt
-                }
+                if (inbox.isEmpty()) continue;
+                history.add(MessageParam.builder().role(MessageParam.Role.USER)
+                        .content(formatTeamEvents(inbox)).build());
+                System.out.println("[wake: " + inbox.size() + " team event(s) -> new turn]");
+                runLeadTurn(history);
+                continue;
             }
 
-            if (!USER_INPUT.hasNextLine()) break;
-            String q = USER_INPUT.nextLine().trim();
+            String q = event.line().trim();
             if (q.isEmpty() || q.equalsIgnoreCase("q") || q.equalsIgnoreCase("exit")) break;
 
-            // 每轮用户输入前也 consume 一次 mailbox, 把可能积累的 team events 一起处理
+            // 用户输入前也 consume 一次 mailbox, 把恰好同时到达的 team events 一起处理
             List<Map<String, Object>> inbox = consumeLeadInbox();
             if (!inbox.isEmpty()) {
                 history.add(MessageParam.builder().role(MessageParam.Role.USER)
                         .content(formatTeamEvents(inbox)).build());
             }
             history.add(MessageParam.builder().role(MessageParam.Role.USER).content(q).build());
-
-            Message r = agentLoop(history);
-            if (r != null) {
-                for (ContentBlock cb : r.content()) {
-                    cb.text().ifPresent(t -> System.out.println(t.text()));
-                }
-            }
-            System.out.println();
+            runLeadTurn(history);
         }
         System.out.println("[shutting down " + TEAMMATE_THREADS.size() + " teammate thread(s)...]");
     }
